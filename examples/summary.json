@@ -1,0 +1,21 @@
+{
+  "archive_uri": "s3://data-lake/DBD001/archive/",
+  "batch_id": "drop-glue-find-42",
+  "failed_files": [],
+  "files_done": 3000,
+  "files_failed": 0,
+  "files_to_rewrite": 3,
+  "files_total": 3000,
+  "generated_at": "2026-11-16T16:05:12+00:00",
+  "hash_mode": "normalized",
+  "month_from": "2026-01",
+  "month_to": "2026-03",
+  "requests_error": 1,
+  "requests_match": 2,
+  "requests_no_match": 1,
+  "requests_total": 4,
+  "rows_to_delete": 4,
+  "schema_version": "3",
+  "skipped_folders": [],
+  "status": "COMPLETE"
+}

@@ -1,0 +1,143 @@
+// drop-glue, Step 1: FIND  (fire-and-forget)
+// Starts ONE run of the <name>-find Glue Spark job and exits without waiting.
+// A run processes at most MAX_WAVES x FILES_PER_WAVE part files, then stops.
+// To continue a batch, build this job again with the same BATCH_ID.
+// Watch progress with Jenkinsfile.status; stop everything with Jenkinsfile.stop.
+//
+// Agent requirements: AWS CLI v2, AWS credentials with the "Jenkins agent"
+// permissions from docs/GUIDE.md, and the Pipeline Utility Steps plugin.
+
+pipeline {
+  agent any
+
+  options {
+    disableConcurrentBuilds()
+    buildDiscarder(logRotator(numToKeepStr: '100'))
+    timeout(time: 15, unit: 'MINUTES')
+  }
+
+  parameters {
+    string(name: 'BATCH_ID', defaultValue: '', description: 'Empty = start a NEW batch named <job>-<build>. An existing batch ID = CONTINUE that batch (the fields below may then be left empty).')
+    string(name: 'INPUT_URI', defaultValue: '', description: 'New batch: input file (JSON array of {run_id, hash_value, match_type}), e.g. s3://JOB_BUCKET/drop-glue/requests/batch-001.json')
+    string(name: 'ARCHIVE_URI', defaultValue: '', description: 'New batch: archive folder, e.g. s3://data-lake/DBD001/archive/')
+    string(name: 'MONTH_FROM', defaultValue: '', description: 'New batch: first month, YYYY-MM (e.g. 2026-01). Leave both months empty to scan the WHOLE archive.')
+    string(name: 'MONTH_TO', defaultValue: '', description: 'New batch: last month, YYYY-MM (inclusive), e.g. 2026-03')
+    choice(name: 'HASH_MODE', choices: ['auto', 'normalized', 'raw'], description: 'auto = normalized for a new batch, unchanged for a continued batch. See guide section 4.')
+    string(name: 'FILES_PER_WAVE', defaultValue: '', description: 'Files processed at the same time. Empty = Terraform default (100).')
+    string(name: 'MAX_WAVES', defaultValue: '', description: 'Waves in this run before it stops (0 = no limit). Empty = Terraform default (5).')
+    string(name: 'WORKERS', defaultValue: '', description: 'Glue workers incl. 1 driver; each G.1X worker runs 4 files at once. Empty = Terraform default (26).')
+    booleanParam(name: 'RETRY_FAILED', defaultValue: false, description: 'Scan files that failed in earlier runs of this batch again')
+    string(name: 'AWS_REGION', defaultValue: 'us-east-1', description: 'Region of the Glue jobs')
+    string(name: 'GLUE_JOB', defaultValue: 'drop-glue-find', description: 'terraform output job_names.find')
+    string(name: 'WORKER_TYPE', defaultValue: 'G.1X', description: 'Must match the Terraform worker_type')
+    string(name: 'STOP_URI', defaultValue: 's3://JOB_BUCKET/drop-glue/control/STOP', description: 'terraform output stop_uri')
+  }
+
+  stages {
+    stage('Validate') {
+      steps {
+        script {
+          String batch = params.BATCH_ID
+          boolean newBatch = !batch
+          if (newBatch) {
+            batch = "${env.JOB_NAME}-${env.BUILD_NUMBER}".replaceAll(/[^A-Za-z0-9_-]/, '-')
+            if (batch.length() > 128) { batch = batch.substring(batch.length() - 128) }
+            checkS3Uri('INPUT_URI', params.INPUT_URI)
+            checkS3Uri('ARCHIVE_URI', params.ARCHIVE_URI)
+          } else {
+            if (params.INPUT_URI) { checkS3Uri('INPUT_URI', params.INPUT_URI) }
+            if (params.ARCHIVE_URI) { checkS3Uri('ARCHIVE_URI', params.ARCHIVE_URI) }
+          }
+          checkBatchId(batch)
+          checkMonth('MONTH_FROM', params.MONTH_FROM)
+          checkMonth('MONTH_TO', params.MONTH_TO)
+          if (params.MONTH_FROM && params.MONTH_TO && params.MONTH_FROM > params.MONTH_TO) { error('MONTH_FROM is after MONTH_TO') }
+          checkNumber('FILES_PER_WAVE', params.FILES_PER_WAVE)
+          checkNumber('MAX_WAVES', params.MAX_WAVES)
+          checkNumber('WORKERS', params.WORKERS)
+          checkS3Uri('STOP_URI', params.STOP_URI)
+          env.BATCH = batch
+          echo(newBatch ? "NEW batch ${batch}" : "CONTINUING batch ${batch}")
+          if (newBatch) {
+            echo((params.MONTH_FROM || params.MONTH_TO)
+              ? "Months ${params.MONTH_FROM ?: '(start)'} .. ${params.MONTH_TO ?: '(end)'}"
+              : 'No month range given: the WHOLE archive will be scanned')
+          }
+        }
+      }
+    }
+
+    stage('Check stop switch') {
+      steps {
+        script { failIfStopped(params.STOP_URI) }
+      }
+    }
+
+    stage('Start Glue run') {
+      steps {
+        script {
+          def arguments = ['--batch_id': env.BATCH]
+          if (params.INPUT_URI) { arguments['--input_uri'] = params.INPUT_URI }
+          if (params.ARCHIVE_URI) { arguments['--archive_uri'] = params.ARCHIVE_URI }
+          if (params.MONTH_FROM) { arguments['--month_from'] = params.MONTH_FROM }
+          if (params.MONTH_TO) { arguments['--month_to'] = params.MONTH_TO }
+          if (params.HASH_MODE != 'auto') { arguments['--hash_mode'] = params.HASH_MODE }
+          if (params.FILES_PER_WAVE) { arguments['--files_per_wave'] = params.FILES_PER_WAVE }
+          if (params.MAX_WAVES) { arguments['--max_waves'] = params.MAX_WAVES }
+          if (params.RETRY_FAILED) { arguments['--retry_failed'] = 'true' }
+          String runId = startGlueJob(params.GLUE_JOB, arguments, params.WORKERS, params.WORKER_TYPE)
+          currentBuild.description = "batch ${env.BATCH} / run ${runId}"
+          echo "Started ${params.GLUE_JOB} run ${runId} for batch ${env.BATCH}."
+          echo "Progress: build drop-glue-status with BATCH_ID=${env.BATCH}."
+          echo "Continue after this run: build this job again with BATCH_ID=${env.BATCH}."
+          echo "Emergency: build drop-glue-stop with ACTION=KILL."
+        }
+      }
+    }
+  }
+}
+
+// ---------------------------------------------------------------- helpers
+// (The same helpers are in every Jenkinsfile so each one stands alone.)
+
+def checkBatchId(String value) {
+  if (!(value ==~ /[A-Za-z0-9_-]{1,128}/)) { error('BATCH_ID must be 1-128 letters, digits, _ or -') }
+}
+
+def checkS3Uri(String name, String value) {
+  if (!(value ==~ /s3:\/\/[a-z0-9][a-z0-9.\-]{1,61}[a-z0-9]\/[A-Za-z0-9!_.*'()\/\-]*/)) {
+    error("${name} must look like s3://bucket/path (got '${value}')")
+  }
+}
+
+def checkMonth(String name, String value) {
+  if (value && !(value ==~ /\d{4}-(0[1-9]|1[0-2])/)) { error("${name} must be YYYY-MM or empty") }
+}
+
+def checkNumber(String name, String value) {
+  if (value && !(value ==~ /\d{1,7}/)) { error("${name} must be a whole number or empty") }
+}
+
+// Fails the build while the emergency stop switch exists (see Jenkinsfile.stop).
+def failIfStopped(String stopUri) {
+  int found = 1
+  withEnv(["STOP_URI_ARG=${stopUri}"]) {
+    found = sh(returnStatus: true, script: '''
+      P="${STOP_URI_ARG#s3://}"
+      aws s3api head-object --region "$AWS_REGION" --bucket "${P%%/*}" --key "${P#*/}" >/dev/null 2>&1
+    ''')
+  }
+  if (found == 0) { error("The STOP switch is ON (${stopUri}). Run drop-glue-stop with ACTION=RESUME first.") }
+}
+
+// Starts a Glue job run and returns its run ID without waiting for it.
+def startGlueJob(String jobName, Map arguments, String workers, String workerType) {
+  writeJSON file: 'glue-args.json', json: arguments
+  String capacity = workers ? '--worker-type "$WORKER_TYPE_ARG" --number-of-workers "$WORKERS_ARG"' : ''
+  String runId = ''
+  withEnv(["GLUE_JOB_NAME=${jobName}", "WORKERS_ARG=${workers}", "WORKER_TYPE_ARG=${workerType}"]) {
+    runId = sh(returnStdout: true, script: 'aws glue start-job-run --region "$AWS_REGION" --job-name "$GLUE_JOB_NAME" ' +
+      '--arguments file://glue-args.json ' + capacity + ' --query JobRunId --output text').trim()
+  }
+  return runId
+}

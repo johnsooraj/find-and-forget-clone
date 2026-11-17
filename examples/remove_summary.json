@@ -1,0 +1,17 @@
+{
+  "batch_id": "drop-glue-find-42",
+  "files": [
+    {"rows_expected": 2, "rows_removed": 2, "seconds": 41.7, "status": "DONE", "uri": "s3://data-lake/DBD001/archive/2026-01-01/AB_CDEFG_DATA_01_part_0001.tar.gz", "versions_deleted": 1},
+    {"reason": "Already completed by an earlier run", "rows_expected": 1, "status": "SKIPPED", "uri": "s3://data-lake/DBD001/archive/2026-01-01/AB_CDEFG_DATA_01_part_0002.tar.gz"},
+    {"rows_expected": 1, "status": "PENDING", "uri": "s3://data-lake/DBD001/archive/2026-02-01/AB_CDEFG_DATA_02_part_0417.tar.gz"}
+  ],
+  "files_done": 1,
+  "files_failed": 0,
+  "files_pending": 1,
+  "files_skipped": 1,
+  "files_total": 3,
+  "generated_at": "2026-11-16T17:40:03+00:00",
+  "purge_old_versions": true,
+  "schema_version": "3",
+  "status": "IN_PROGRESS"
+}

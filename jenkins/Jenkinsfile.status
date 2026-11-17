@@ -1,0 +1,76 @@
+// drop-glue: STATUS of a batch (read-only)
+// Shows the stop switch, the batch's Glue runs (find and forget), and the
+// progress and results. Attaches the reports as build artifacts so they can be
+// reviewed before approving deletion (Jenkinsfile.forget).
+
+pipeline {
+  agent any
+
+  options {
+    buildDiscarder(logRotator(numToKeepStr: '200'))
+    timeout(time: 10, unit: 'MINUTES')
+  }
+
+  parameters {
+    string(name: 'BATCH_ID', defaultValue: '', description: 'Batch to report on')
+    string(name: 'AWS_REGION', defaultValue: 'us-east-1', description: 'Region of the Glue jobs')
+    string(name: 'FIND_JOB', defaultValue: 'drop-glue-find', description: 'terraform output job_names.find')
+    string(name: 'FORGET_JOB', defaultValue: 'drop-glue-forget', description: 'terraform output job_names.forget')
+    string(name: 'RESULT_PREFIX', defaultValue: 's3://JOB_BUCKET/drop-glue/results/', description: 'terraform output result_prefix')
+    string(name: 'STOP_URI', defaultValue: 's3://JOB_BUCKET/drop-glue/control/STOP', description: 'terraform output stop_uri')
+  }
+
+  stages {
+    stage('Report') {
+      steps {
+        script {
+          if (!(params.BATCH_ID ==~ /[A-Za-z0-9_-]{1,128}/)) { error('BATCH_ID must be 1-128 letters, digits, _ or -') }
+          currentBuild.description = "batch ${params.BATCH_ID}"
+          withEnv(["STOP_URI_ARG=${params.STOP_URI}", "BASE=${params.RESULT_PREFIX}${params.BATCH_ID}/"]) {
+            sh '''
+              P="${STOP_URI_ARG#s3://}"
+              if aws s3api head-object --region "$AWS_REGION" --bucket "${P%%/*}" --key "${P#*/}" >/dev/null 2>&1; then
+                echo "STOP SWITCH: ON  (new runs are refused; running jobs stop before their next wave)"
+                aws s3 cp "$STOP_URI_ARG" - --region "$AWS_REGION" || true
+              else
+                echo "STOP SWITCH: off"
+              fi
+              for J in "$FIND_JOB" "$FORGET_JOB"; do
+                echo "---- Glue runs of $J for batch $BATCH_ID ----"
+                aws glue get-job-runs --region "$AWS_REGION" --job-name "$J" --output table \
+                  --query "JobRuns[?Arguments.\\"--batch_id\\"=='$BATCH_ID'].{Id:Id,State:JobRunState,Started:StartedOn,Seconds:ExecutionTime,Workers:NumberOfWorkers,Error:ErrorMessage}"
+              done
+              rm -f summary.json results.json remove_summary.json
+              for F in summary.json results.json remove_summary.json; do
+                aws s3 cp "${BASE}$F" "$F" --region "$AWS_REGION" --only-show-errors 2>/dev/null || true
+              done
+            '''
+          }
+          if (fileExists('summary.json')) {
+            def s = readJSON file: 'summary.json'
+            echo "FIND ${s.status}: ${s.files_done} of ${s.files_total} part files done, ${s.files_failed} failed"
+            echo "  Months ${s.month_from ?: '(start)'} .. ${s.month_to ?: '(end)'}, hash_mode ${s.hash_mode}"
+            echo "  So far: ${s.rows_to_delete} rows to delete in ${s.files_to_rewrite} part files"
+            s.failed_files.each { f -> echo "  FAILED FILE ${f.uri}: ${f.error}" }
+            if (s.status == 'COMPLETE') {
+              echo "  Items: ${s.requests_total} total, ${s.requests_match} MATCH, ${s.requests_no_match} NO_MATCH, ${s.requests_error} ERROR"
+              echo '  Review results.json (build artifact), then run drop-glue-forget to delete.'
+            } else {
+              echo "  Not finished: build drop-glue-find again with BATCH_ID=${params.BATCH_ID} to continue."
+            }
+          } else {
+            echo 'No summary.json yet: Find has not finished its first wave (or the batch does not exist).'
+          }
+          if (fileExists('remove_summary.json')) {
+            def r = readJSON file: 'remove_summary.json'
+            echo "FORGET ${r.status}: ${r.files_done} done, ${r.files_skipped} skipped, ${r.files_failed} failed, ${r.files_pending} pending (of ${r.files_total})"
+            r.files.each { f ->
+              if (f.status == 'FAILED') { echo "  FAILED ${f.uri}: ${f.error}" }
+            }
+          }
+          archiveArtifacts artifacts: 'summary.json, results.json, remove_summary.json', allowEmptyArchive: true
+        }
+      }
+    }
+  }
+}

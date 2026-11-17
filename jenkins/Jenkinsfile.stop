@@ -1,0 +1,94 @@
+// drop-glue: EMERGENCY STOP
+//
+//   KILL    Turn the stop switch ON and stop running Glue runs immediately.
+//   PAUSE   Turn the stop switch ON only: running jobs finish their current
+//           wave, save it, and exit. Nothing new can start.
+//   RESUME  Turn the stop switch OFF (type RESUME in CONFIRM).
+//
+// While the switch is ON, the Find and Forget pipelines refuse to start and the
+// Glue jobs exit at start-up and before every wave. Stopped batches continue
+// safely later with the same BATCH_ID. See docs/GUIDE.md, "Emergency stop".
+
+pipeline {
+  agent any
+
+  options {
+    buildDiscarder(logRotator(numToKeepStr: '100'))
+    timeout(time: 10, unit: 'MINUTES')
+  }
+
+  parameters {
+    choice(name: 'ACTION', choices: ['KILL', 'PAUSE', 'RESUME'], description: 'KILL = stop now; PAUSE = stop after the current wave; RESUME = allow runs again')
+    choice(name: 'JOBS', choices: ['both', 'find', 'forget'], description: 'KILL: which jobs to stop')
+    string(name: 'BATCH_ID', defaultValue: '', description: 'KILL: only stop runs of this batch. Empty = every running run.')
+    string(name: 'REASON', defaultValue: '', description: 'Why (stored in the switch and shown by drop-glue-status)')
+    string(name: 'CONFIRM', defaultValue: '', description: 'RESUME only: type RESUME')
+    string(name: 'AWS_REGION', defaultValue: 'us-east-1', description: 'Region of the Glue jobs')
+    string(name: 'FIND_JOB', defaultValue: 'drop-glue-find', description: 'terraform output job_names.find')
+    string(name: 'FORGET_JOB', defaultValue: 'drop-glue-forget', description: 'terraform output job_names.forget')
+    string(name: 'STOP_URI', defaultValue: 's3://JOB_BUCKET/drop-glue/control/STOP', description: 'terraform output stop_uri')
+  }
+
+  stages {
+    stage('Validate') {
+      steps {
+        script {
+          if (params.BATCH_ID && !(params.BATCH_ID ==~ /[A-Za-z0-9_-]{1,128}/)) { error('BATCH_ID must be 1-128 letters, digits, _ or -') }
+          if (!(params.STOP_URI ==~ /s3:\/\/[a-z0-9][a-z0-9.\-]{1,61}[a-z0-9]\/[A-Za-z0-9!_.*'()\/\-]+/)) { error('STOP_URI must look like s3://bucket/key') }
+          if (params.ACTION == 'RESUME' && params.CONFIRM != 'RESUME') { error('Type RESUME in CONFIRM to turn the stop switch off') }
+          currentBuild.description = "${params.ACTION}${params.BATCH_ID ? ' ' + params.BATCH_ID : ''}"
+        }
+      }
+    }
+
+    stage('Stop switch ON') {
+      when { expression { params.ACTION in ['KILL', 'PAUSE'] } }
+      steps {
+        script {
+          writeJSON file: 'stop.json', json: [
+            action: params.ACTION, reason: params.REASON, batch_id: params.BATCH_ID,
+            jenkins_build: env.BUILD_URL,
+          ]
+          sh 'aws s3 cp stop.json "$STOP_URI" --region "$AWS_REGION" --only-show-errors'
+          echo "STOP switch is ON (${params.STOP_URI}). New runs are refused; running jobs stop before their next wave."
+        }
+      }
+    }
+
+    stage('Kill running Glue runs') {
+      when { expression { params.ACTION == 'KILL' } }
+      steps {
+        script {
+          String jobs = params.JOBS == 'both' ? "${params.FIND_JOB} ${params.FORGET_JOB}" : (params.JOBS == 'find' ? params.FIND_JOB : params.FORGET_JOB)
+          withEnv(["JOBS_LIST=${jobs}"]) {
+            sh '''
+              set -eu
+              FILTER=""
+              if [ -n "$BATCH_ID" ]; then FILTER=" && Arguments.\\"--batch_id\\"=='$BATCH_ID'"; fi
+              for J in $JOBS_LIST; do
+                IDS=$(aws glue get-job-runs --region "$AWS_REGION" --job-name "$J" --output text \
+                  --query "JobRuns[?(JobRunState=='STARTING' || JobRunState=='RUNNING' || JobRunState=='WAITING')$FILTER].Id")
+                if [ -n "$IDS" ] && [ "$IDS" != "None" ]; then
+                  echo "Stopping $J runs: $IDS"
+                  aws glue batch-stop-job-run --region "$AWS_REGION" --job-name "$J" --job-run-ids $IDS
+                else
+                  echo "No running $J runs${BATCH_ID:+ for batch $BATCH_ID}"
+                fi
+              done
+            '''
+          }
+          echo 'Stop requested. Glue moves the runs to STOPPING, then STOPPED. Check with drop-glue-status.'
+          echo 'Saved waves and finished parts are kept; continue later with the same BATCH_ID after RESUME.'
+        }
+      }
+    }
+
+    stage('Stop switch OFF') {
+      when { expression { params.ACTION == 'RESUME' } }
+      steps {
+        sh 'aws s3 rm "$STOP_URI" --region "$AWS_REGION" --only-show-errors || true'
+        echo 'STOP switch is OFF. Find and Forget can run again.'
+      }
+    }
+  }
+}

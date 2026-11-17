@@ -1,0 +1,127 @@
+// drop-glue, Step 3: FORGET  (fire-and-forget)
+// Starts ONE run of the <name>-forget Glue Spark job and exits without waiting.
+// Each matched part file is rewritten ONCE, without the found rows, under the
+// same name. A run handles at most MAX_WAVES x FILES_PER_WAVE parts; build this
+// job again with the same BATCH_ID to continue (finished parts are skipped).
+//
+// Only after reviewing the batch with Jenkinsfile.status. Type the batch ID
+// twice (BATCH_ID and CONFIRM_BATCH_ID) as a safety check.
+
+pipeline {
+  agent any
+
+  options {
+    disableConcurrentBuilds()
+    buildDiscarder(logRotator(numToKeepStr: '100'))
+    timeout(time: 15, unit: 'MINUTES')
+  }
+
+  parameters {
+    string(name: 'BATCH_ID', defaultValue: '', description: 'Batch whose Find report should be applied (Find must be COMPLETE)')
+    string(name: 'CONFIRM_BATCH_ID', defaultValue: '', description: 'Type the batch ID again to confirm deletion')
+    booleanParam(name: 'PURGE_OLD_VERSIONS', defaultValue: false, description: 'Also delete old S3 versions that still contain the rows (cannot be undone)')
+    string(name: 'FILES_PER_WAVE', defaultValue: '', description: 'Parts rewritten at the same time. Empty = Terraform default (100).')
+    string(name: 'MAX_WAVES', defaultValue: '', description: 'Waves in this run before it stops (0 = no limit). Empty = Terraform default (5).')
+    string(name: 'WORKERS', defaultValue: '', description: 'Glue workers incl. 1 driver; each G.1X worker rewrites 4 parts at once. Empty = Terraform default (26).')
+    string(name: 'AWS_REGION', defaultValue: 'us-east-1', description: 'Region of the Glue jobs')
+    string(name: 'GLUE_JOB', defaultValue: 'drop-glue-forget', description: 'terraform output job_names.forget')
+    string(name: 'WORKER_TYPE', defaultValue: 'G.1X', description: 'Must match the Terraform worker_type')
+    string(name: 'RESULT_PREFIX', defaultValue: 's3://JOB_BUCKET/drop-glue/results/', description: 'terraform output result_prefix')
+    string(name: 'STOP_URI', defaultValue: 's3://JOB_BUCKET/drop-glue/control/STOP', description: 'terraform output stop_uri')
+  }
+
+  stages {
+    stage('Validate') {
+      steps {
+        script {
+          checkBatchId(params.BATCH_ID)
+          if (params.CONFIRM_BATCH_ID != params.BATCH_ID) { error('CONFIRM_BATCH_ID does not match BATCH_ID') }
+          checkNumber('FILES_PER_WAVE', params.FILES_PER_WAVE)
+          checkNumber('MAX_WAVES', params.MAX_WAVES)
+          checkNumber('WORKERS', params.WORKERS)
+          checkS3Uri('RESULT_PREFIX', params.RESULT_PREFIX)
+          checkS3Uri('STOP_URI', params.STOP_URI)
+        }
+      }
+    }
+
+    stage('Check stop switch') {
+      steps {
+        script { failIfStopped(params.STOP_URI) }
+      }
+    }
+
+    stage('Check Find is COMPLETE') {
+      steps {
+        script {
+          withEnv(["SUMMARY_URI=${params.RESULT_PREFIX}${params.BATCH_ID}/summary.json"]) {
+            sh 'aws s3 cp "$SUMMARY_URI" summary.json --region "$AWS_REGION" --only-show-errors'
+          }
+          def s = readJSON file: 'summary.json'
+          if (s.status != 'COMPLETE') { error("Find for batch ${params.BATCH_ID} is ${s.status}, not COMPLETE") }
+          echo "Batch ${params.BATCH_ID}: ${s.rows_to_delete} rows to delete in ${s.files_to_rewrite} part files"
+          if (s.files_to_rewrite == 0) { error('Nothing to delete in this batch') }
+        }
+      }
+    }
+
+    stage('Start Glue run') {
+      steps {
+        script {
+          def arguments = [
+            '--batch_id'          : params.BATCH_ID,
+            '--purge_old_versions': params.PURGE_OLD_VERSIONS ? 'true' : 'false',
+          ]
+          if (params.FILES_PER_WAVE) { arguments['--files_per_wave'] = params.FILES_PER_WAVE }
+          if (params.MAX_WAVES) { arguments['--max_waves'] = params.MAX_WAVES }
+          String runId = startGlueJob(params.GLUE_JOB, arguments, params.WORKERS, params.WORKER_TYPE)
+          currentBuild.description = "batch ${params.BATCH_ID} / run ${runId} (purge=${params.PURGE_OLD_VERSIONS})"
+          echo "Started ${params.GLUE_JOB} run ${runId} for batch ${params.BATCH_ID}."
+          echo "Progress: build drop-glue-status with BATCH_ID=${params.BATCH_ID}."
+          echo "If remove_summary.json says IN_PROGRESS, build this job again with the same BATCH_ID."
+        }
+      }
+    }
+  }
+}
+
+// ---------------------------------------------------------------- helpers
+// (The same helpers are in every Jenkinsfile so each one stands alone.)
+
+def checkBatchId(String value) {
+  if (!(value ==~ /[A-Za-z0-9_-]{1,128}/)) { error('BATCH_ID must be 1-128 letters, digits, _ or -') }
+}
+
+def checkS3Uri(String name, String value) {
+  if (!(value ==~ /s3:\/\/[a-z0-9][a-z0-9.\-]{1,61}[a-z0-9]\/[A-Za-z0-9!_.*'()\/\-]*/)) {
+    error("${name} must look like s3://bucket/path (got '${value}')")
+  }
+}
+
+def checkNumber(String name, String value) {
+  if (value && !(value ==~ /\d{1,7}/)) { error("${name} must be a whole number or empty") }
+}
+
+// Fails the build while the emergency stop switch exists (see Jenkinsfile.stop).
+def failIfStopped(String stopUri) {
+  int found = 1
+  withEnv(["STOP_URI_ARG=${stopUri}"]) {
+    found = sh(returnStatus: true, script: '''
+      P="${STOP_URI_ARG#s3://}"
+      aws s3api head-object --region "$AWS_REGION" --bucket "${P%%/*}" --key "${P#*/}" >/dev/null 2>&1
+    ''')
+  }
+  if (found == 0) { error("The STOP switch is ON (${stopUri}). Run drop-glue-stop with ACTION=RESUME first.") }
+}
+
+// Starts a Glue job run and returns its run ID without waiting for it.
+def startGlueJob(String jobName, Map arguments, String workers, String workerType) {
+  writeJSON file: 'glue-args.json', json: arguments
+  String capacity = workers ? '--worker-type "$WORKER_TYPE_ARG" --number-of-workers "$WORKERS_ARG"' : ''
+  String runId = ''
+  withEnv(["GLUE_JOB_NAME=${jobName}", "WORKERS_ARG=${workers}", "WORKER_TYPE_ARG=${workerType}"]) {
+    runId = sh(returnStdout: true, script: 'aws glue start-job-run --region "$AWS_REGION" --job-name "$GLUE_JOB_NAME" ' +
+      '--arguments file://glue-args.json ' + capacity + ' --query JobRunId --output text').trim()
+  }
+  return runId
+}
