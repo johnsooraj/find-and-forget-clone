@@ -35,6 +35,12 @@ variable "name" {
   }
 }
 
+variable "tags" {
+  description = "Tags added to every resource (provider default_tags), e.g. { environment = \"prod\" }."
+  type        = map(string)
+  default     = {}
+}
+
 # ---------------------------------------------------------------- capacity and throttling
 variable "worker_type" {
   description = "Glue worker type. G.1X = 4 vCPU / 16 GB / 64 GB disk = 4 part files at a time per worker."
@@ -79,19 +85,78 @@ variable "forget_timeout" {
 
 # ---------------------------------------------------------------- deletion and logs
 variable "allow_version_purge" {
-  description = "Grant the Forget role permission to delete old object versions. The job only purges when PURGE_OLD_VERSIONS=true."
+  description = "Grant the Forget role permission to delete old object versions. The job only purges when FORGET_STRATEGY=REPLACE_PURGE_OLD_VERSIONS."
   type        = bool
   default     = true
 }
 
-variable "manage_log_groups" {
-  description = "Create the shared /aws-glue/jobs/{output,error,logs-v2} log groups with a retention period. Leave false if they already exist."
+variable "allow_lifecycle_tagging" {
+  description = "Grant the Forget role permission to tag old object versions (FORGET_STRATEGY=REPLACE_TAG_FOR_LIFECYCLE)."
+  type        = bool
+  default     = true
+}
+
+variable "manage_source_lifecycle" {
+  description = "Create a lifecycle rule on the SOURCE bucket that expires versions tagged drop-glue-superseded=true. WARNING: replaces every other lifecycle rule of that bucket; keep false if the bucket already has a lifecycle configuration."
   type        = bool
   default     = false
 }
 
+variable "superseded_version_days" {
+  description = "Days after which a superseded (tagged) old version is deleted by the lifecycle rule."
+  type        = number
+  default     = 7
+
+  validation {
+    condition     = var.superseded_version_days >= 1
+    error_message = "superseded_version_days must be at least 1."
+  }
+}
+
+# ---------------------------------------------------------------- processed-file tracker
+variable "tracker" {
+  description = "Processed-file tracker: DYNAMODB (a table created here), S3_TAG (a tag on each part file) or NONE."
+  type        = string
+  default     = "DYNAMODB"
+
+  validation {
+    condition     = contains(["DYNAMODB", "S3_TAG", "NONE"], var.tracker)
+    error_message = "tracker must be DYNAMODB, S3_TAG or NONE."
+  }
+}
+
+variable "tracker_table_name" {
+  description = "DynamoDB table name for tracker = DYNAMODB. Empty = <name>-processed-files."
+  type        = string
+  default     = ""
+}
+
+# ---------------------------------------------------------------- notifications (placeholder)
+variable "notifier" {
+  description = "How the jobs send notifications: LOG (print to the job log; default until a transport is chosen), SES or SNS (placeholders)."
+  type        = string
+  default     = "LOG"
+
+  validation {
+    condition     = contains(["LOG", "SES", "SNS"], var.notifier)
+    error_message = "notifier must be LOG, SES or SNS."
+  }
+}
+
+variable "notify_to" {
+  description = "Comma-separated recipients (email addresses for SES, a topic ARN for SNS). Placeholder."
+  type        = string
+  default     = ""
+}
+
+variable "notification_topic_arn" {
+  description = "SNS topic for Glue run state changes (FAILED/TIMEOUT/STOPPED/ERROR). Empty = no EventBridge rule. Placeholder."
+  type        = string
+  default     = ""
+}
+
 variable "log_retention_days" {
-  description = "Log retention when manage_log_groups is true."
+  description = "Retention of each job's own log group /aws-glue/jobs/<name>-<find|forget> (continuous driver/executor logs)."
   type        = number
   default     = 30
 }

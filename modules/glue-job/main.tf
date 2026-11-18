@@ -1,3 +1,5 @@
+# One Glue 5.0 Spark job, and the CloudWatch log group its continuous logs go to.
+
 terraform {
   required_providers {
     aws = {
@@ -6,63 +8,19 @@ terraform {
   }
 }
 
-data "aws_partition" "current" {}
-data "aws_region" "current" {}
-data "aws_caller_identity" "current" {}
-
 locals {
-  log_groups = "arn:${data.aws_partition.current.partition}:logs:${data.aws_region.current.region}:${data.aws_caller_identity.current.account_id}:log-group:/aws-glue/*"
+  log_group = "/aws-glue/jobs/${var.name}"
 }
 
-resource "aws_iam_role" "job" {
-  name = var.name
-  assume_role_policy = jsonencode({
-    Version = "2012-10-17"
-    Statement = [{
-      Effect    = "Allow"
-      Action    = "sts:AssumeRole"
-      Principal = { Service = "glue.amazonaws.com" }
-    }]
-  })
-}
-
-resource "aws_iam_role_policy" "job" {
-  role = aws_iam_role.job.name
-  policy = jsonencode({
-    Version = "2012-10-17"
-    Statement = concat(
-      [
-        {
-          Effect   = "Allow"
-          Action   = ["s3:GetObject"]
-          Resource = var.read_arns
-        },
-        {
-          Effect   = "Allow"
-          Action   = ["s3:PutObject"]
-          Resource = var.write_arns
-        },
-        {
-          Effect   = "Allow"
-          Action   = ["logs:CreateLogGroup", "logs:CreateLogStream", "logs:PutLogEvents", "logs:AssociateKmsKey"]
-          Resource = [local.log_groups, "${local.log_groups}:*"]
-        },
-        {
-          Effect    = "Allow"
-          Action    = ["cloudwatch:PutMetricData"]
-          Resource  = "*"
-          Condition = { StringEquals = { "cloudwatch:namespace" = "Glue" } }
-        }
-      ],
-      var.extra_statements
-    )
-  })
+resource "aws_cloudwatch_log_group" "job" {
+  name              = local.log_group
+  retention_in_days = var.log_retention_days
 }
 
 resource "aws_glue_job" "job" {
   name              = var.name
-  role_arn          = aws_iam_role.job.arn
-  glue_version      = "5.0"
+  role_arn          = var.role_arn
+  glue_version      = var.glue_version
   worker_type       = var.worker_type
   number_of_workers = var.number_of_workers
   timeout           = var.timeout
@@ -82,20 +40,11 @@ resource "aws_glue_job" "job" {
   default_arguments = merge({
     "--job-language"                     = "python"
     "--enable-continuous-cloudwatch-log" = "true"
+    "--continuous-log-logGroup"          = aws_cloudwatch_log_group.job.name
     "--enable-metrics"                   = "true"
     "--enable-job-insights"              = "true"
   }, var.default_arguments)
 
   # Jenkins can never change these.
   non_overridable_arguments = var.fixed_arguments
-
-  depends_on = [aws_iam_role_policy.job]
-}
-
-output "name" {
-  value = aws_glue_job.job.name
-}
-
-output "role_arn" {
-  value = aws_iam_role.job.arn
 }

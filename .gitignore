@@ -1,6 +1,10 @@
 .terraform/
 *.tfstate*
-*.tfvars
 *.tfplan
 __pycache__/
 .pytest_cache/
+
+# Variable files: only the per-environment files in tfvars/ are committed
+# (bucket names and sizing only; never put secrets in them).
+*.tfvars
+!tfvars/*.tfvars

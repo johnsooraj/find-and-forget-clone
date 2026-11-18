@@ -35,9 +35,12 @@ Every CSV row has a unique `TRAN_ID`, and its `RAW_RESPONSE` column holds XML wi
 
 | Piece | What it does |
 |---|---|
-| **Find** (`scripts/find.py`, Glue job `drop-glue-find`) | Scans every part file in the chosen months, hashes the values in each row's XML and compares them with your input hashes. It reports **MATCH / NO_MATCH / ERROR** per input item, with every part file and transaction ID where the customer was found. It also prepares a **work list with one line per part file**. |
-| **Forget** (`scripts/forget.py`, Glue job `drop-glue-forget`) | For each part in the work list, **once**, it loads the part, drops the listed transaction IDs, and saves a new `.tar.gz` under the **same S3 key with the same CSV name inside**. |
+| **Find** (`scripts/find.py`, Glue job `drop-glue-find`) | Scans every part file in the chosen months with the chosen **find strategy** ([1.2](#12-find-strategies)): by default it hashes the values in each row's XML and compares them with your input hashes, reporting **MATCH / NO_MATCH / ERROR** per input item with every part file and transaction ID where the customer was found. It also prepares a **work list with one line per part file**. |
+| **Forget** (`scripts/forget.py`, Glue job `drop-glue-forget`) | For each part in the work list, **once**, it loads the part, drops the listed transaction IDs, and saves a new `.tar.gz` under the **same S3 key with the same CSV name inside**. The **forget strategy** ([1.3](#13-forget-strategies)) decides what happens to the old S3 version. |
+| `scripts/arguments.py` | Layer 1: parses and validates the job arguments |
+| `scripts/find_strategies.py`, `scripts/forget_strategies.py` | The strategies (one class each) |
 | `scripts/tasks.py` | The work for one part file, run inside Spark tasks |
+| `scripts/tracking.py`, `scripts/notify.py` | Processed-file tracker ([1.4](#14-processed-file-tracker)) and notifications ([1.5](#15-notifications-placeholder)) |
 | `scripts/common.py`, `scripts/formats.py` | Shared helpers, and all JSON layouts |
 | 4 Jenkins pipelines | **find**, **status**, **forget** and **stop**. They start a job and exit without waiting. |
 
@@ -72,12 +75,89 @@ flowchart LR
   GF & GR -. "check before every wave" .-> STOP
 ```
 
-**What Terraform creates** (11 resources):
-- The 5 script files in S3.
-- 2 Glue 5.0 Spark jobs.
+**What Terraform creates** (one module per resource, see [7.2](#72-deploy)):
+- The 10 script files in S3.
+- 2 Glue 5.0 Spark jobs, each with its own CloudWatch log group.
 - 2 least-privilege IAM roles, each with 1 policy.
+- 1 DynamoDB table for the processed-file tracker (when `tracker = "DYNAMODB"`, the default).
 
-Optionally it also creates the Glue log groups. It creates **no** buckets, Cognito, API Gateway, Lambda, Step Functions, DynamoDB or ECS.
+Optionally it also creates a lifecycle rule on the source bucket (`manage_source_lifecycle`) and an EventBridge rule for failed runs (`notification_topic_arn`). It creates **no** buckets, Cognito, API Gateway, Lambda, Step Functions or ECS.
+
+### 1.1 Three layers
+
+The tool is a batch framework built on the **Strategy pattern**: each layer depends on an interface, and the Jenkins drop-downs pick the implementation.
+
+```mermaid
+flowchart LR
+  P["Jenkins parameters<br/>FIND_STRATEGY / FORGET_STRATEGY"] --> L1["Layer 1: arguments.py<br/>parse + validate → FindConfig / ForgetConfig"]
+  L1 --> L2["Layer 2: find.py + FindStrategy<br/>HASH_MATCH | TRAN_ID_SUFFIX"]
+  T[("Processed-file tracker<br/>DynamoDB | S3 tag")] -. "checked when a batch starts" .-> L2
+  L2 -- "files.jsonl (one line per part)" --> L3["Layer 3: forget.py + ForgetStrategy<br/>KEEP | PURGE | TAG_FOR_LIFECYCLE"]
+  L2 & L3 -. "records" .-> T
+  L2 & L3 -. "JOB_STARTED / FINISHED / FAILED" .-> N["notify.py<br/>(placeholder)"]
+```
+
+Forget reads **only** Layer 2's `files.jsonl`, so every forget strategy works with every find strategy, and the rule "one rewrite per part file" holds for all of them: 12 monthly files with matches mean 12 rewrites, however many rows are deleted.
+
+### 1.2 Find strategies
+
+| `FIND_STRATEGY` | Input | What is found | `results.json` |
+|---|---|---|---|
+| `HASH_MATCH` (default) | `INPUT_URI`: `[{run_id, hash_value, match_type}]` | Rows whose XML field (phone, email, name, address) hashes to an input hash ([section 4](#4-how-hashing-works)) | One entry per input item: MATCH / NO_MATCH / ERROR + `data_identifier` |
+| `TRAN_ID_SUFFIX` | none (leave `INPUT_URI` empty) | Rows whose `TRAN_ID` ends with `TRAN_ID_SUFFIX` (default `_c`, case-sensitive). The XML is not read. | One document: `{find_strategy, tran_id_suffix, match_result, match_count, data_identifier: {part uri: [TRAN_IDs]}}` (see `examples/results_suffix.json`) |
+
+### 1.3 Forget strategies
+
+Every strategy rewrites each part once (one GET, one PUT, same key). They differ in what happens to the **old S3 version**, which still holds the removed rows on a versioned bucket:
+
+| `FORGET_STRATEGY` | Old version | Needs |
+|---|---|---|
+| `REPLACE_KEEP_VERSIONS` (default) | Kept. It disappears only if the bucket has its own non-current version rule. | - |
+| `REPLACE_PURGE_OLD_VERSIONS` | Deleted right after the rewrite. **Can't be undone.** | `allow_version_purge = true` |
+| `REPLACE_TAG_FOR_LIFECYCLE` | Tagged `drop-glue-superseded=true`; a lifecycle rule expires it after `superseded_version_days` (default 7), which leaves a window to recover from a mistake. | `allow_lifecycle_tagging = true`, and the lifecycle rule (below) |
+
+The lifecycle rule filters on prefix + tag `drop-glue-superseded=true` with `NoncurrentVersionExpiration`. Terraform creates it only when `manage_source_lifecycle = true`, because `aws_s3_bucket_lifecycle_configuration` **replaces every other lifecycle rule** on the source bucket. If the bucket already has a lifecycle configuration, add the same rule there instead.
+
+You can change strategy between Forget runs of the same batch: a part already rewritten is not rewritten again, only the new strategy's step runs (e.g. KEEP first, then PURGE later).
+
+### 1.4 Processed-file tracker
+
+The tracker avoids scanning part files again when the answer can't have changed. It keeps one record per **(part file, scope)**, where scope = find strategy + a fingerprint of its settings and the input file's ETag.
+
+| Written by | Record | When |
+|---|---|---|
+| Find | `SCANNED_NO_MATCH` + the file's ETag | after each wave, for files with no matches |
+| Forget | `CLEANED` + the **new** ETag | after each wave, for rewritten files |
+
+When a **new batch** starts, Find lists the selected files (with their ETags, at no extra cost) and skips a file when its scope has a record **and** its ETag is unchanged. As a result:
+- Re-running the same input skips files that had no matches and files already cleaned.
+- Files with matches that were not forgotten yet are **always scanned again**, so results stay complete.
+- A file changed by anything else gets a new ETag and is scanned again.
+- A new input file (new ETag) or other settings give a new scope, so everything is scanned again.
+
+Skipped files count as scanned with no matches (`files_skipped_tracked` in `summary.json`). Backends (Terraform `tracker`):
+
+| `tracker` | Where | Notes |
+|---|---|---|
+| `DYNAMODB` (default) | Table `<name>-processed-files` (PK `file_uri`, SK `scope`), on-demand, PITR on | Lookups in batches of 100, cheap at any size |
+| `S3_TAG` | Tag `drop-glue-<strategy>=<fingerprint>:<stage>` on the part file | No extra infrastructure; one GetObjectTagging call per selected file; S3 allows 10 tags per object; a tag belongs to one version, so a rewrite by anything else drops it (and the file is scanned again) |
+| `NONE` | - | Every file is always scanned |
+
+A failed tracker **write** only prints a warning (worst case: a file is scanned again). A failed **lookup** fails the run before anything is scanned.
+
+### 1.5 Notifications (placeholder)
+
+`scripts/notify.py` holds **one common template** (subject + body) for every event. It contains batch IDs, statuses, counts and report locations only, never customer data.
+
+| Event | Sent by |
+|---|---|
+| `JOB_STARTED` | the Glue job, when the run starts |
+| `JOB_FINISHED` | the Glue job, with status COMPLETE / IN_PROGRESS / STOPPED and the counts |
+| `JOB_FAILED` | the Glue job, when the run raises an error |
+| Run killed / timed out / stuck | EventBridge rule on "Glue Job State Change" (FAILED, TIMEOUT, STOPPED, ERROR) → SNS topic `notification_topic_arn` |
+| Pipeline failed / aborted | `post` blocks in the Jenkinsfiles |
+
+Until the transport is decided, `notifier = "LOG"` prints the message to the job log; `SES` and `SNS` are placeholders (TODO). A notification never fails a job.
 
 ---
 
@@ -184,7 +264,7 @@ To check a value yourself:
 - **Linux/macOS:** `printf '%s' '12025550134' | sha256sum`
 - **PowerShell:** `[BitConverter]::ToString([Security.Cryptography.SHA256]::Create().ComputeHash([Text.Encoding]::UTF8.GetBytes('12025550134'))).Replace('-','').ToLower()`
 
-**ADDRESS** is currently read from a single element. If your XML splits an address across several elements, the joining rule must be agreed and added to `tasks.find_hits`.
+**ADDRESS** is currently read from a single element. If your XML splits an address across several elements, the joining rule must be agreed and added to `find_strategies.find_hits`.
 
 ---
 
@@ -223,7 +303,7 @@ flowchart LR
 **Sizing with a pilot run.** The key number is how long one 100 MB part takes, which depends on how heavy the XML is. Measure it before the first real batch:
 
 1. Run Find on one month with `FILES_PER_WAVE=20`, `MAX_WAVES=1`, `WORKERS=6`.
-2. In the CloudWatch log (`/aws-glue/jobs/output`) the wave line shows, for example, `wave-00001.jsonl: 20 files (0 failed) in 190s, 2000 MB (10.5 MB/s), slowest file 185s`. Every file in `waves/` also records its own `seconds` and `rows`.
+2. In the job's CloudWatch log (`/aws-glue/jobs/<name>-find`) the wave line shows, for example, `wave-00001.jsonl: 20 files (0 failed) in 190s, 2000 MB (10.5 MB/s), slowest file 185s`. Every file in `waves/` also records its own `seconds` and `rows`.
 3. Estimate the time for a full batch as `parts × seconds per part ÷ files at once`. For example, 3,000 parts × 180 s ÷ 100 = 5,400 s ≈ **1.5 h** of processing. With the defaults (500 parts per run) that's **6 Find runs** of about 15 minutes each (5 waves × ~180 s).
 4. Estimate the cost as `WORKERS × hours × price per DPU-hour`. For example, 26 × 1.5 × $0.44 ≈ **$17**. Check your region's price.
 
@@ -278,20 +358,47 @@ flowchart TD
 | ☐ | **Bucket policies** | If they restrict principals, allow the two Glue roles. |
 | ☐ | **Glue capacity quota** | Your account's maximum DPUs must cover `WORKERS` (default 26). |
 | ☐ | **Jenkins agent** | AWS CLI v2, the *Pipeline Utility Steps* plugin, and AWS credentials with the permissions in [section 12](#12-who-can-do-what). |
-| ☐ | **Terraform** ≥ 1.5 | AWS provider 6.x. |
+| ☐ | **Terraform** ≥ 1.10 | AWS provider 6.x. 1.10 is needed for S3 native state locking. |
+| ☐ | **State bucket per environment** (existing) | A **separate** bucket for the Terraform state (not the data lake or job bucket), with versioning and default encryption. Set its name and key in `backend/<env>.s3.tfbackend`. Whoever runs Terraform needs `s3:ListBucket` on it and `s3:GetObject`/`PutObject`/`DeleteObject` on the state key and its `.tflock` file. |
 | ☐ | **Hashing rule agreed** | See [section 4](#4-how-hashing-works). |
 
 ### 7.2 Deploy
 
+Each environment has **two files**: where its state lives, and its variables.
+
 ```text
-cp terraform.tfvars.example terraform.tfvars     # then edit the bucket names / region
-terraform init
+backend/stage.s3.tfbackend   backend/prod.s3.tfbackend   ← state bucket, key, region, locking
+tfvars/stage.tfvars          tfvars/prod.tfvars          ← buckets, name, sizing, tracker …
+tfvars/example.tfvars                                    ← every variable with its default (reference)
+```
+
+1. Edit `backend/<env>.s3.tfbackend`: the state bucket's name and the key (e.g. `drop-glue/prod/terraform.tfstate`).
+2. Edit `tfvars/<env>.tfvars`: the buckets, region and `name`. **Give every environment its own `name`** when they share an AWS account (Glue job, IAM role and table names are account-wide).
+3. Deploy (here `stage`; use `prod` the same way):
+
+```text
+terraform init -reconfigure -backend-config=backend/stage.s3.tfbackend
 terraform fmt -check -recursive
 terraform validate
-terraform plan -out=drop-glue.tfplan              # review: 11 resources
-terraform apply drop-glue.tfplan
+terraform plan -var-file=tfvars/stage.tfvars -out=stage.tfplan
+terraform apply stage.tfplan
 terraform output
 ```
+
+Always run `init -reconfigure` with the matching backend file before switching environment; otherwise the plan would run against the other environment's state. To add an environment (e.g. `dev`), copy both files and change the key, name and buckets.
+
+**Module layout:** each resource has its own module, and the root (`main.tf`) only wires them together:
+
+| Module | Resource(s) | Created |
+|---|---|---|
+| `modules/s3-scripts` | the 10 Python scripts in the job bucket | always |
+| `modules/iam-role` | one IAM role + its inline policy, per job | always (2) |
+| `modules/glue-job` | one Glue Spark job **+ its CloudWatch log group** `/aws-glue/jobs/<name>-<find\|forget>` | always (2) |
+| `modules/dynamodb-table` | the processed-file tracker table | `tracker = "DYNAMODB"` |
+| `modules/s3-lifecycle` | lifecycle rule expiring superseded versions | `manage_source_lifecycle = true` |
+| `modules/eventbridge-rule` | rule + SNS target for failed/killed runs | `notification_topic_arn` set |
+
+`moved.tf` maps an existing deployment from the older layout onto these modules, so nothing is destroyed. It also stops managing the old shared `/aws-glue/jobs/*` log groups without deleting them.
 
 Expected output (values differ):
 
@@ -327,9 +434,9 @@ Reports contain transaction IDs and hashes. Add a lifecycle rule to the job buck
 
 ## 8. Step 1: Find
 
-### 8.1 Prepare the input file
+### 8.1 Prepare the input file (HASH_MATCH only)
 
-Upload a JSON array to `s3://JOB_BUCKET/drop-glue/requests/` (full example: [`examples/input.json`](../examples/input.json)):
+`TRAN_ID_SUFFIX` needs no input file: skip to 8.2. For `HASH_MATCH`, upload a JSON array to `s3://JOB_BUCKET/drop-glue/requests/` (full example: [`examples/input.json`](../examples/input.json)):
 
 ```json
 [
@@ -353,17 +460,19 @@ Build **drop-glue-find**:
 | Parameter | Example | Meaning |
 |---|---|---|
 | `BATCH_ID` | (empty) | Empty starts a **new** batch named `<job>-<build number>` |
-| `INPUT_URI` | `s3://JOB_BUCKET/drop-glue/requests/batch-2026-11-16.json` | The file from 8.1 |
+| `FIND_STRATEGY` | `HASH_MATCH` | The drop-down: `HASH_MATCH` or `TRAN_ID_SUFFIX` ([1.2](#12-find-strategies)). Used for a new batch only. |
+| `TRAN_ID_SUFFIX` | `_c` | `TRAN_ID_SUFFIX` only: the suffix to pick |
+| `INPUT_URI` | `s3://JOB_BUCKET/drop-glue/requests/batch-2026-11-16.json` | `HASH_MATCH` only: the file from 8.1 (leave empty for `TRAN_ID_SUFFIX`) |
 | `ARCHIVE_URI` | `s3://data-lake/DBD001/archive/` | The archive folder, or a single part file |
 | `MONTH_FROM` / `MONTH_TO` | `2026-01` / `2026-03` | Inclusive. The folder `2026-01-01` belongs to month `2026-01`. **Leave both empty to scan the whole archive.** |
-| `HASH_MODE` | `auto` | `auto` means `normalized` for a new batch ([section 4](#4-how-hashing-works)) |
+| `HASH_MODE` | `auto` | `HASH_MATCH` only. `auto` means `normalized` for a new batch ([section 4](#4-how-hashing-works)) |
 | `FILES_PER_WAVE` / `MAX_WAVES` / `WORKERS` | (empty) | Empty uses the Terraform defaults ([section 5](#5-throttling-and-sizing)) |
 
 The build prints the batch ID and the Glue run ID, then **exits**. The Glue run carries on in AWS.
 
 ### 8.3 Continue a batch
 
-When `status` shows `IN_PROGRESS`, build **drop-glue-find** again with **`BATCH_ID` set** and the other fields empty. The batch remembers its input, archive, months and hash mode, and passing a different value is refused. Only one run of each job can be active at a time.
+When `status` shows `IN_PROGRESS`, build **drop-glue-find** again with **`BATCH_ID` set** and the other fields empty. The batch remembers its strategy and its settings, input, archive and months, and passing a different value is refused. Only one run of each job can be active at a time.
 
 `RETRY_FAILED=true` scans parts that failed in earlier runs again, for example after a temporary S3 error. This is allowed until Forget has started on the batch.
 
@@ -373,13 +482,13 @@ When `status` shows `IN_PROGRESS`, build **drop-glue-find** again with **`BATCH_
 flowchart TD
   A{STOP switch on?} -- yes --> X[Exit without doing anything]
   A -- no --> B{batch.json exists?}
-  B -- no --> C["New batch: read input, list month folders,<br/>save selected_files.jsonl + batch.json"]
-  B -- yes --> D["Continue: check input ETag and settings unchanged"]
-  C & D --> E[Skip parts already in waves/]
+  B -- no --> C["New batch: read input (HASH_MATCH), list month folders,<br/>ask the tracker which files to skip,<br/>save selected_files.jsonl + batch.json"]
+  B -- yes --> D["Continue: check strategy, settings and input ETag unchanged"]
+  C & D --> E[Skip parts already in waves/ or skipped by the tracker]
   E --> F{"Parts left and<br/>waves &lt; MAX_WAVES?"}
   F -- yes --> G{STOP switch on?}
   G -- yes --> I
-  G -- no --> H["Wave: FILES_PER_WAVE parts in parallel,<br/>each read ONCE and every row's XML hashed;<br/>save waves/wave-NNNNN.jsonl"]
+  G -- no --> H["Wave: FILES_PER_WAVE parts in parallel,<br/>each read ONCE, every row asked to the strategy;<br/>save waves/wave-NNNNN.jsonl;<br/>record no-match files in the tracker"]
   H --> F
   F -- "no, parts left" --> I["summary.json: IN_PROGRESS"]
   F -- "no, all done" --> J["results.json + files.jsonl,<br/>summary.json: COMPLETE"]
@@ -389,7 +498,7 @@ An unreadable part (corrupt archive, wrong inner CSV name, bad CSV row or invali
 
 ### 8.5 The outputs (in `results/<BATCH_ID>/`)
 
-**`results.json`** (when COMPLETE) has one entry per input item, in input order ([`examples/results.json`](../examples/results.json)):
+**`results.json`** (when COMPLETE) depends on the strategy. For `TRAN_ID_SUFFIX` it is a single document listing every `_c` transaction ID by part file ([`examples/results_suffix.json`](../examples/results_suffix.json)). For `HASH_MATCH` it has one entry per input item, in input order ([`examples/results.json`](../examples/results.json)):
 
 ```json
 {
@@ -411,7 +520,7 @@ An unreadable part (corrupt archive, wrong inner CSV name, bad CSV row or invali
 | `NO_MATCH` | Every part in scope was scanned and none matched |
 | `ERROR` | The item is invalid (see `error`), **or** some part couldn't be scanned and the item wasn't found elsewhere, so NO_MATCH can't be confirmed |
 
-**`files.jsonl`** (when COMPLETE) is the work list for Forget, with one line per part to rewrite ([`examples/files.jsonl`](../examples/files.jsonl)).
+**`files.jsonl`** (when COMPLETE) is the work list for Forget, with one line per part to rewrite ([`examples/files.jsonl`](../examples/files.jsonl)). It has the same shape for every strategy (`run_ids` is empty for `TRAN_ID_SUFFIX`).
 
 **`summary.json`** shows progress and counts, with `status` IN_PROGRESS or COMPLETE ([`examples/summary.json`](../examples/summary.json)).
 
@@ -444,7 +553,7 @@ Build **drop-glue-forget**:
 | Parameter | Meaning |
 |---|---|
 | `BATCH_ID` / `CONFIRM_BATCH_ID` | The batch to apply, typed twice as a safety check. Find must be COMPLETE. |
-| `PURGE_OLD_VERSIONS` | `true` also deletes the **old S3 versions** of each rewritten part, so the data is truly gone. **This can't be undone.** With `false`, old versions remain until a bucket lifecycle rule expires them. |
+| `FORGET_STRATEGY` | The drop-down ([1.3](#13-forget-strategies)): `REPLACE_KEEP_VERSIONS` keeps the old S3 versions; `REPLACE_PURGE_OLD_VERSIONS` deletes them now (**can't be undone**); `REPLACE_TAG_FOR_LIFECYCLE` tags them so the lifecycle rule deletes them after `superseded_version_days`. |
 | `FILES_PER_WAVE` / `MAX_WAVES` / `WORKERS` | Throttling, as in Find |
 
 The build exits after starting the run. If `remove_summary.json` (shown by `status`) says `IN_PROGRESS`, build Forget again with the same batch. Finished parts are skipped.
@@ -454,8 +563,8 @@ The build exits after starting the run. If `remove_summary.json` (shown by `stat
 ```mermaid
 flowchart TD
   A[Next part in files.jsonl] --> B{Completion marker exists?}
-  B -- "yes, nothing pending" --> S[SKIPPED]
-  B -- "yes, purge pending" --> P
+  B -- "yes, strategy step done" --> S[SKIPPED]
+  B -- "yes, strategy step pending" --> P
   B -- no --> C{Part unchanged since Find?<br/>ETag must match}
   C -- no --> C2{"Already replaced by this batch?<br/>(metadata tags)"}
   C2 -- yes --> M
@@ -465,9 +574,9 @@ flowchart TD
   E -- no --> F2[FAILED: nothing written]
   E -- yes --> R["Save new .tar.gz: same S3 key,<br/>same CSV name, header kept<br/>(conditional PUT)"]
   R --> M[Write completion marker]
-  M --> Q{PURGE_OLD_VERSIONS?}
-  Q -- no --> OK[DONE]
-  Q -- yes --> P[Delete every non-current version<br/>of this part]
+  M --> Q{FORGET_STRATEGY}
+  Q -- KEEP --> OK[DONE + tracker: CLEANED]
+  Q -- "PURGE / TAG_FOR_LIFECYCLE" --> P["Strategy step: delete the non-current versions,<br/>or tag the old version drop-glue-superseded=true"]
   P --> OK
 ```
 
@@ -484,7 +593,7 @@ Two user-metadata tags are added: `drop-glue-batch` and `drop-glue-source-etag`.
 - **IN_PROGRESS**: parts are left, so run Forget again.
 - **INCOMPLETE**: some parts failed; the Glue run is marked failed.
 
-> **About versions:** if the data lake bucket is versioned and you don't purge, the deleted rows still exist in the previous versions. Either set `PURGE_OLD_VERSIONS=true` or add a lifecycle rule that expires non-current versions.
+> **About versions:** if the data lake bucket is versioned and you use `REPLACE_KEEP_VERSIONS`, the deleted rows still exist in the previous versions. Use `REPLACE_PURGE_OLD_VERSIONS`, or `REPLACE_TAG_FOR_LIFECYCLE` with the lifecycle rule, or add a bucket rule that expires non-current versions.
 
 ---
 
@@ -492,17 +601,18 @@ Two user-metadata tags are added: `drop-glue-batch` and `drop-glue-source-etag`.
 
 ```text
 s3://JOB_BUCKET/drop-glue/
-├── scripts/<sha256>/{find,forget,tasks,common,formats}.py   ← uploaded by Terraform
+├── scripts/<sha256>/{find,forget,arguments,find_strategies,forget_strategies,
+│                     tasks,tracking,notify,common,formats}.py   ← uploaded by Terraform
 ├── control/STOP                          ← emergency stop switch (exists = ON)
 ├── requests/
 │   └── batch-2026-11-16.json             ← input file (you; don't change during a batch)
 └── results/
     └── drop-glue-find-42/                ← one folder per BATCH_ID
-        ├── batch.json                    ← fixed settings (first run)
-        ├── selected_files.jsonl          ← the parts in the month range (first run)
+        ├── batch.json                    ← fixed settings: strategy, settings, tracker scope (first run)
+        ├── selected_files.jsonl          ← the parts in the month range, ETag, tracker skip (first run)
         ├── waves/wave-00001.jsonl …      ← per-part scan results, one file per wave
         ├── summary.json                  ← progress; COMPLETE when done
-        ├── results.json                  ← one entry per input item (COMPLETE)
+        ├── results.json                  ← the strategy's results (COMPLETE)
         ├── files.jsonl                   ← work list: one line per part (COMPLETE)
         ├── done/<sha256(uri)>.json       ← one marker per rewritten part (forget)
         └── remove_summary.json           ← forget progress and outcome
@@ -511,6 +621,8 @@ s3://DATA_LAKE/DBD001/archive/            ← source_prefix: the ONLY place the 
 ├── 2026-01-01/AB_CDEFG_DATA_01_part_0001.tar.gz … _part_1000.tar.gz
 ├── 2026-02-01/AB_CDEFG_DATA_02_part_0001.tar.gz …
 └── ...
+
+DynamoDB <name>-processed-files           ← tracker = DYNAMODB: (file_uri, scope) → etag, stage, batch_id
 ```
 
 ---
@@ -538,6 +650,10 @@ flowchart LR
   GR -- "list + get + put" --> RES
   GR -- "get + put (replace)" --> LAKE
   GR -. "list versions + delete version<br/>(if allow_version_purge)" .-> LAKE
+  GR -. "get/put version tagging<br/>(if allow_lifecycle_tagging)" .-> LAKE
+  DDB[("DynamoDB tracker table")]
+  FR & GR -. "batch get / batch write<br/>(tracker = DYNAMODB)" .-> DDB
+  FR & GR -. "get/put object tagging<br/>(tracker = S3_TAG)" .-> LAKE
 ```
 
 **Jenkins agent policy** (create this in your own IAM setup; Terraform doesn't create it):
@@ -563,16 +679,18 @@ The Glue roles can only list inside their own prefixes. They can't touch anythin
 ## 13. Troubleshooting
 
 Glue logs are in CloudWatch, under the Glue run ID that the Jenkins console prints:
-- `/aws-glue/jobs/output`: driver progress, with one line per wave
-- `/aws-glue/jobs/error`
-- `/aws-glue/jobs/logs-v2`: continuous logs
+- `/aws-glue/jobs/<name>-find` and `/aws-glue/jobs/<name>-forget` (`terraform output log_groups`): each job's own continuous log, with driver progress (one line per wave) and executor logs. Created by `modules/glue-job` with `log_retention_days`.
+- `/aws-glue/jobs/output` and `/aws-glue/jobs/error`: Glue's shared groups (not managed here)
 
 | Symptom / message | Meaning | What to do |
 |---|---|---|
 | Every item is `NO_MATCH` | The hashing rule doesn't match the upstream one | Check [section 4](#4-how-hashing-works) with one known customer; try `HASH_MODE=raw` in a new batch |
 | `The STOP switch is ON` | Someone ran KILL or PAUSE | Find out why; then run stop with `ACTION=RESUME` |
 | `summary.json` stays `IN_PROGRESS` | Each run is capped by `MAX_WAVES` | Build find again with the same `BATCH_ID` |
-| `… differs from this batch` | You passed a different input, archive, month or hash mode while continuing | Leave those fields empty to continue, or start a new batch |
+| `… differs from this batch` | You passed a different strategy, input, archive, month, hash mode or suffix while continuing | Leave those fields empty to continue, or start a new batch |
+| `TRAN_ID_SUFFIX does not read an input file` | `INPUT_URI` was set for a suffix batch | Leave `INPUT_URI` empty |
+| `could not record … in the tracker` (warning) | The tracker table or tags couldn't be written | The run carries on; those files are scanned again next time. Check the IAM role and the table. |
+| Every file is scanned although nothing changed | New input ETag, other settings, or the file was changed | Expected ([1.4](#14-processed-file-tracker)) |
 | `The input file changed since this batch started` | The input was edited mid-batch | Start a new batch |
 | `Find for batch … is IN_PROGRESS, not COMPLETE` | Forget was started too early | Finish Find first |
 | `failed_files`: `Expected a single CSV named …_part_0001.csv` | The archive's inner file name doesn't match the part name | Investigate that part |
@@ -594,12 +712,12 @@ The formats are expected to change. All code that knows the JSON layouts is in *
 | You change… | Edit in `formats.py` | Example file |
 |---|---|---|
 | The input file | `parse_input()` | `examples/input.json` |
-| `results.json` | `result_entry()` | `examples/results.json` |
+| `results.json` | `result_entry()` (HASH_MATCH), `suffix_result()` (TRAN_ID_SUFFIX) | `examples/results.json`, `examples/results_suffix.json` |
 | `files.jsonl` | `file_line()`, `parse_file_line()` | `examples/files.jsonl` |
 | `summary.json` | `build_summary()`, `parse_summary()` | `examples/summary.json` |
 | `remove_summary.json` | `build_remove_summary()` | `examples/remove_summary.json` |
 | `batch.json` / wave files | `build_batch()`, `wave_line()`, `parse_wave_line()` | `examples/batch.json`, `examples/wave-00001.jsonl` |
-| How MATCH/NO_MATCH/ERROR is decided | `decide()` in `find.py` | `examples/results.json` |
+| How MATCH/NO_MATCH/ERROR is decided | `build_results()` of the strategy in `find_strategies.py` | `examples/results.json` |
 
 **Checklist**
 1. Edit the example in [`examples/`](../examples/) to the new shape.
@@ -608,6 +726,18 @@ The formats are expected to change. All code that knows the JSON layouts is in *
 4. Run `pytest tests/`. `tests/test_formats.py` fails until the examples and the code agree.
 5. Update section 8 of this guide, and the `readJSON` fields in `jenkins/Jenkinsfile.status` and `Jenkinsfile.forget` if you renamed any `summary.json` field.
 6. Run `terraform apply` to upload the new scripts. Their S3 folders are content hashes, so the jobs switch to them atomically.
+
+### 14.1 Adding a strategy
+
+**Find strategy** (`scripts/find_strategies.py`):
+1. Subclass `FindStrategy`: set `name` and `needs_input`, and implement `new_settings`, `changed_settings`, `shared`, `match_row` (a staticmethod: it runs on the Spark executors and gets only the plain dict from `shared`), `labels` and `build_results`. Add `parse_input` if it reads an input file.
+2. Add it to `FIND_STRATEGIES`.
+3. Add its name to the `FIND_STRATEGY` choice in `jenkins/Jenkinsfile.find`, plus any new parameter (also in `arguments.parse_find_args` / `find_config`).
+4. Add a test like `tests/test_strategies.py`, and an example results file if it has its own shape.
+
+It must return its matches as `{match key: [TRAN_ID, …]}` per file; the driver turns them into the same `files.jsonl`, so Forget needs no change.
+
+**Forget strategy** (`scripts/forget_strategies.py`): subclass `ForgetStrategy`, implement `after_replace` (it must be safe to run twice), set `has_post_step`, add it to `FORGET_STRATEGIES` and to the `FORGET_STRATEGY` choice in `jenkins/Jenkinsfile.forget`, and grant any new IAM action in `main.tf`.
 
 ---
 
@@ -624,7 +754,10 @@ The formats are expected to change. All code that knows the JSON layouts is in *
 | **ETag** | S3's fingerprint of an object. Forget only rewrites a part whose ETag still matches the one recorded by Find. |
 | **Conditional PUT** | An S3 write that succeeds only if the object hasn't changed (`If-Match`) or doesn't exist yet (`If-None-Match`) |
 | **Non-current version** | An older copy kept by S3 versioning. It still contains the deleted rows until purged or expired. |
-| **Completion marker** | `done/<hash>.json`: proof that a part was rewritten, used to skip it on reruns |
+| **Completion marker** | `done/<hash>.json`: proof that a part was rewritten (and which strategy steps ran), used to skip it on reruns |
+| **Strategy** | The pluggable behaviour of a layer: `FIND_STRATEGY` decides what is found, `FORGET_STRATEGY` what happens to the old version |
+| **Tracker scope** | `<find strategy>#<fingerprint of settings + input ETag>`: "same strategy, same input" |
+| **Superseded version** | The old version of a rewritten part, tagged `drop-glue-superseded=true` by `REPLACE_TAG_FOR_LIFECYCLE` |
 | **G.1X worker / DPU** | Glue capacity unit: 4 vCPU and 16 GB. One worker is the Spark driver; each other worker runs 4 parts at once. |
 | **source_prefix** | The only data lake prefix the jobs may read or rewrite (a Terraform variable) |
 

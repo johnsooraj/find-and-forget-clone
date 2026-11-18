@@ -4,10 +4,11 @@
   "failed_files": [],
   "files_done": 3000,
   "files_failed": 0,
+  "files_skipped_tracked": 120,
   "files_to_rewrite": 3,
   "files_total": 3000,
+  "find_strategy": "HASH_MATCH",
   "generated_at": "2026-11-16T16:05:12+00:00",
-  "hash_mode": "normalized",
   "month_from": "2026-01",
   "month_to": "2026-03",
   "requests_error": 1,
@@ -15,7 +16,16 @@
   "requests_no_match": 1,
   "requests_total": 4,
   "rows_to_delete": 4,
-  "schema_version": "3",
+  "schema_version": "4",
   "skipped_folders": [],
-  "status": "COMPLETE"
+  "status": "COMPLETE",
+  "strategy_settings": {
+    "hash_mode": "normalized",
+    "tags": {
+      "ADDRESS": "address,fullAddress",
+      "EMAIL": "email,emailAddress",
+      "NAME": "name,fullName",
+      "PHONE": "phone,phoneNumber"
+    }
+  }
 }

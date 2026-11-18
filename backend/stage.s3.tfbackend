@@ -1,0 +1,10 @@
+# S3 remote state for STAGE.
+#   terraform init -reconfigure -backend-config=backend/stage.s3.tfbackend
+#
+# The state bucket is a SEPARATE, existing bucket: not the data lake bucket
+# and not the Glue job bucket. Turn on versioning and default encryption on it.
+bucket       = "your-terraform-state-bucket-stage"
+key          = "drop-glue/stage/terraform.tfstate"
+region       = "us-east-1"
+encrypt      = true
+use_lockfile = true # S3 native locking (Terraform >= 1.10); no DynamoDB lock table needed

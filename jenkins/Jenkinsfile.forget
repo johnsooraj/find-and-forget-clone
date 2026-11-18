@@ -19,7 +19,7 @@ pipeline {
   parameters {
     string(name: 'BATCH_ID', defaultValue: '', description: 'Batch whose Find report should be applied (Find must be COMPLETE)')
     string(name: 'CONFIRM_BATCH_ID', defaultValue: '', description: 'Type the batch ID again to confirm deletion')
-    booleanParam(name: 'PURGE_OLD_VERSIONS', defaultValue: false, description: 'Also delete old S3 versions that still contain the rows (cannot be undone)')
+    choice(name: 'FORGET_STRATEGY', choices: ['REPLACE_KEEP_VERSIONS', 'REPLACE_PURGE_OLD_VERSIONS', 'REPLACE_TAG_FOR_LIFECYCLE'], description: 'Every strategy rewrites each part once under the same name. Old S3 version: KEEP = leave it; PURGE = delete old versions now (cannot be undone); TAG_FOR_LIFECYCLE = tag it drop-glue-superseded=true so the lifecycle rule expires it.')
     string(name: 'FILES_PER_WAVE', defaultValue: '', description: 'Parts rewritten at the same time. Empty = Terraform default (100).')
     string(name: 'MAX_WAVES', defaultValue: '', description: 'Waves in this run before it stops (0 = no limit). Empty = Terraform default (5).')
     string(name: 'WORKERS', defaultValue: '', description: 'Glue workers incl. 1 driver; each G.1X worker rewrites 4 parts at once. Empty = Terraform default (26).')
@@ -69,19 +69,25 @@ pipeline {
       steps {
         script {
           def arguments = [
-            '--batch_id'          : params.BATCH_ID,
-            '--purge_old_versions': params.PURGE_OLD_VERSIONS ? 'true' : 'false',
+            '--batch_id'       : params.BATCH_ID,
+            '--forget_strategy': params.FORGET_STRATEGY,
           ]
           if (params.FILES_PER_WAVE) { arguments['--files_per_wave'] = params.FILES_PER_WAVE }
           if (params.MAX_WAVES) { arguments['--max_waves'] = params.MAX_WAVES }
           String runId = startGlueJob(params.GLUE_JOB, arguments, params.WORKERS, params.WORKER_TYPE)
-          currentBuild.description = "batch ${params.BATCH_ID} / run ${runId} (purge=${params.PURGE_OLD_VERSIONS})"
+          currentBuild.description = "batch ${params.BATCH_ID} / run ${runId} (${params.FORGET_STRATEGY})"
           echo "Started ${params.GLUE_JOB} run ${runId} for batch ${params.BATCH_ID}."
           echo "Progress: build drop-glue-status with BATCH_ID=${params.BATCH_ID}."
           echo "If remove_summary.json says IN_PROGRESS, build this job again with the same BATCH_ID."
         }
       }
     }
+  }
+
+  post {
+    // PLACEHOLDER: pipeline-level notifications (see Jenkinsfile.find).
+    failure { echo "TODO notify: drop-glue FORGET pipeline FAILED for batch ${params.BATCH_ID}" }
+    aborted { echo "TODO notify: drop-glue FORGET pipeline ABORTED for batch ${params.BATCH_ID}" }
   }
 }
 

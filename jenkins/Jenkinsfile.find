@@ -1,5 +1,8 @@
 // drop-glue, Step 1: FIND  (fire-and-forget)
 // Starts ONE run of the <name>-find Glue Spark job and exits without waiting.
+// FIND_STRATEGY picks how rows are found (layer 2):
+//   HASH_MATCH      input hashes vs. hashed XML fields (needs INPUT_URI)
+//   TRAN_ID_SUFFIX  every row whose TRAN_ID ends with TRAN_ID_SUFFIX (no input file)
 // A run processes at most MAX_WAVES x FILES_PER_WAVE part files, then stops.
 // To continue a batch, build this job again with the same BATCH_ID.
 // Watch progress with Jenkinsfile.status; stop everything with Jenkinsfile.stop.
@@ -18,11 +21,13 @@ pipeline {
 
   parameters {
     string(name: 'BATCH_ID', defaultValue: '', description: 'Empty = start a NEW batch named <job>-<build>. An existing batch ID = CONTINUE that batch (the fields below may then be left empty).')
-    string(name: 'INPUT_URI', defaultValue: '', description: 'New batch: input file (JSON array of {run_id, hash_value, match_type}), e.g. s3://JOB_BUCKET/drop-glue/requests/batch-001.json')
+    choice(name: 'FIND_STRATEGY', choices: ['HASH_MATCH', 'TRAN_ID_SUFFIX'], description: 'New batch: HASH_MATCH = match the input hashes in the XML; TRAN_ID_SUFFIX = pick every row whose TRAN_ID ends with TRAN_ID_SUFFIX (no input file). Ignored when continuing a batch.')
+    string(name: 'TRAN_ID_SUFFIX', defaultValue: '_c', description: 'TRAN_ID_SUFFIX only: the suffix to pick (case-sensitive)')
+    string(name: 'INPUT_URI', defaultValue: '', description: 'New HASH_MATCH batch: input file (JSON array of {run_id, hash_value, match_type}), e.g. s3://JOB_BUCKET/drop-glue/requests/batch-001.json. Leave empty for TRAN_ID_SUFFIX.')
     string(name: 'ARCHIVE_URI', defaultValue: '', description: 'New batch: archive folder, e.g. s3://data-lake/DBD001/archive/')
     string(name: 'MONTH_FROM', defaultValue: '', description: 'New batch: first month, YYYY-MM (e.g. 2026-01). Leave both months empty to scan the WHOLE archive.')
     string(name: 'MONTH_TO', defaultValue: '', description: 'New batch: last month, YYYY-MM (inclusive), e.g. 2026-03')
-    choice(name: 'HASH_MODE', choices: ['auto', 'normalized', 'raw'], description: 'auto = normalized for a new batch, unchanged for a continued batch. See guide section 4.')
+    choice(name: 'HASH_MODE', choices: ['auto', 'normalized', 'raw'], description: 'HASH_MATCH only. auto = normalized for a new batch, unchanged for a continued batch. See guide section 4.')
     string(name: 'FILES_PER_WAVE', defaultValue: '', description: 'Files processed at the same time. Empty = Terraform default (100).')
     string(name: 'MAX_WAVES', defaultValue: '', description: 'Waves in this run before it stops (0 = no limit). Empty = Terraform default (5).')
     string(name: 'WORKERS', defaultValue: '', description: 'Glue workers incl. 1 driver; each G.1X worker runs 4 files at once. Empty = Terraform default (26).')
@@ -39,10 +44,17 @@ pipeline {
         script {
           String batch = params.BATCH_ID
           boolean newBatch = !batch
+          boolean hashMatch = params.FIND_STRATEGY == 'HASH_MATCH'
           if (newBatch) {
             batch = "${env.JOB_NAME}-${env.BUILD_NUMBER}".replaceAll(/[^A-Za-z0-9_-]/, '-')
             if (batch.length() > 128) { batch = batch.substring(batch.length() - 128) }
-            checkS3Uri('INPUT_URI', params.INPUT_URI)
+            if (hashMatch) {
+              checkS3Uri('INPUT_URI', params.INPUT_URI)
+            } else {
+              if (params.INPUT_URI) { error('TRAN_ID_SUFFIX does not read an input file: leave INPUT_URI empty') }
+              if (params.HASH_MODE != 'auto') { error('HASH_MODE applies only to HASH_MATCH') }
+              if (!(params.TRAN_ID_SUFFIX ==~ /[A-Za-z0-9_.\-]{1,32}/)) { error('TRAN_ID_SUFFIX must be 1-32 letters, digits, _ . or -') }
+            }
             checkS3Uri('ARCHIVE_URI', params.ARCHIVE_URI)
           } else {
             if (params.INPUT_URI) { checkS3Uri('INPUT_URI', params.INPUT_URI) }
@@ -57,7 +69,8 @@ pipeline {
           checkNumber('WORKERS', params.WORKERS)
           checkS3Uri('STOP_URI', params.STOP_URI)
           env.BATCH = batch
-          echo(newBatch ? "NEW batch ${batch}" : "CONTINUING batch ${batch}")
+          env.NEW_BATCH = newBatch ? 'true' : 'false'
+          echo(newBatch ? "NEW ${params.FIND_STRATEGY} batch ${batch}" : "CONTINUING batch ${batch} (its stored strategy is used)")
           if (newBatch) {
             echo((params.MONTH_FROM || params.MONTH_TO)
               ? "Months ${params.MONTH_FROM ?: '(start)'} .. ${params.MONTH_TO ?: '(end)'}"
@@ -77,6 +90,10 @@ pipeline {
       steps {
         script {
           def arguments = ['--batch_id': env.BATCH]
+          if (env.NEW_BATCH == 'true') {
+            arguments['--find_strategy'] = params.FIND_STRATEGY
+            if (params.FIND_STRATEGY == 'TRAN_ID_SUFFIX') { arguments['--tran_id_suffix'] = params.TRAN_ID_SUFFIX }
+          }
           if (params.INPUT_URI) { arguments['--input_uri'] = params.INPUT_URI }
           if (params.ARCHIVE_URI) { arguments['--archive_uri'] = params.ARCHIVE_URI }
           if (params.MONTH_FROM) { arguments['--month_from'] = params.MONTH_FROM }
@@ -94,6 +111,13 @@ pipeline {
         }
       }
     }
+  }
+
+  post {
+    // PLACEHOLDER: pipeline-level notifications (the Glue job sends its own
+    // JOB_STARTED/FINISHED/FAILED; EventBridge covers killed/timed-out runs).
+    failure { echo "TODO notify: drop-glue FIND pipeline FAILED for batch ${env.BATCH ?: '(none)'}" }
+    aborted { echo "TODO notify: drop-glue FIND pipeline ABORTED for batch ${env.BATCH ?: '(none)'}" }
   }
 }
 

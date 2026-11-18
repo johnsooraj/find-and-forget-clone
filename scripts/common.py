@@ -1,12 +1,12 @@
-"""Shared code for find.py, forget.py and tasks.py: S3 helpers, archive
-reading, value normalization, month selection, the stop switch and the
-Spark/local runners.
+"""Shared code for every layer: S3 helpers, archive reading, value
+normalization, month selection, the stop switch and the Spark/local runners.
 
 Shipped to both Glue jobs with --extra-py-files (see main.tf).
 """
 import csv
 import datetime
 import gzip
+import hashlib
 import io
 import json
 import re
@@ -53,36 +53,6 @@ def parse_int(value, name, minimum, maximum):
     if not minimum <= number <= maximum:
         raise ValueError(f"{name} must be between {minimum} and {maximum}")
     return number
-
-
-def add_fixed_arguments(parser):
-    """Arguments Terraform sets as non-overridable Glue arguments."""
-    parser.add_argument("--region", required=True)
-    parser.add_argument("--source_prefix", required=True)
-    parser.add_argument("--result_prefix", required=True)
-    parser.add_argument("--stop_uri", required=True)
-
-
-def add_throttle_arguments(parser):
-    """Defaults come from Terraform; Jenkins may override them per run."""
-    parser.add_argument("--files_per_wave", default="100")
-    parser.add_argument("--max_waves", default="5")
-
-
-def check_fixed_arguments(args):
-    for name in ("source_prefix", "result_prefix"):
-        value = getattr(args, name)
-        if not value.startswith("s3://") or not value.endswith("/"):
-            raise ValueError(f"--{name} must be an s3:// prefix ending in /")
-    location(args.stop_uri)
-
-
-def throttle(args):
-    """Return (files_per_wave, max_waves). max_waves 0 means no limit."""
-    return (
-        parse_int(args.files_per_wave, "--files_per_wave", 1, MAX_FILES_PER_WAVE),
-        parse_int(args.max_waves, "--max_waves", 0, 1_000_000),
-    )
 
 
 def raise_csv_limit():
@@ -156,9 +126,9 @@ def put_lines(s3, uri, documents, create_only):
     s3.put_object(**location(uri), Body=payload, ContentType="application/x-ndjson", **extra)
 
 
-def list_keys(s3, bucket, prefix, delimiter=None):
-    """Return (folder prefixes, object keys) under prefix, following pagination."""
-    folders, keys, token = [], [], None
+def list_objects(s3, bucket, prefix, delimiter=None):
+    """Return (folder prefixes, {object key: ETag}) under prefix, following pagination."""
+    folders, objects, token = [], {}, None
     while True:
         kwargs = {"Bucket": bucket, "Prefix": prefix}
         if delimiter:
@@ -167,10 +137,41 @@ def list_keys(s3, bucket, prefix, delimiter=None):
             kwargs["ContinuationToken"] = token
         page = s3.list_objects_v2(**kwargs)
         folders += [item["Prefix"] for item in page.get("CommonPrefixes", [])]
-        keys += [item["Key"] for item in page.get("Contents", [])]
+        objects.update({item["Key"]: item.get("ETag") for item in page.get("Contents", [])})
         if not page.get("IsTruncated"):
-            return folders, keys
+            return folders, objects
         token = page["NextContinuationToken"]
+
+
+def list_keys(s3, bucket, prefix, delimiter=None):
+    """Return (folder prefixes, object keys) under prefix, following pagination."""
+    folders, objects = list_objects(s3, bucket, prefix, delimiter)
+    return folders, list(objects)
+
+
+MAX_TAGS = 10  # S3 limit per object (version)
+
+
+def get_tags(s3, bucket, key, version_id=None):
+    """{tag key: value} of one object version (the current one when version_id is None)."""
+    extra = {"VersionId": version_id} if version_id else {}
+    response = s3.get_object_tagging(Bucket=bucket, Key=key, **extra)
+    return {t["Key"]: t["Value"] for t in response.get("TagSet", [])}
+
+
+def put_merged_tags(s3, bucket, key, updates, version_id=None):
+    """Add/replace `updates` on an object version, keeping its other tags.
+
+    PutObjectTagging replaces the whole tag set, so read it first. Does not
+    change the object's ETag or create a new version.
+    """
+    tags = get_tags(s3, bucket, key, version_id)
+    tags.update(updates)
+    if len(tags) > MAX_TAGS:
+        raise ValueError(f"s3://{bucket}/{key} would have more than {MAX_TAGS} tags")
+    extra = {"VersionId": version_id} if version_id else {}
+    s3.put_object_tagging(Bucket=bucket, Key=key, Tagging={"TagSet": [{"Key": k, "Value": v}
+                                                                      for k, v in sorted(tags.items())]}, **extra)
 
 
 def object_exists(s3, uri):
@@ -212,6 +213,10 @@ class SparkRunner:
 
 
 # ----------------------------------------------------------------------------- values
+def sha256_hex(text):
+    return hashlib.sha256(text.encode("utf-8")).hexdigest()
+
+
 def normalize(value, match_type, mode="normalized"):
     """Turn an XML field value into the text that is hashed.
 
@@ -292,9 +297,9 @@ def under_prefix(uri, source_prefix):
 
 
 def resolve_archive_uri(uri, source_prefix):
-    """Accept a folder (trailing slash added) or one .tar.gz, under the allowed prefix."""
+    """Accept a folder (trailing slash added) or one .tar.gz, under the allowed prefix. Empty -> None."""
     if not uri:
-        raise ValueError("Provide --archive_uri")
+        return None
     if not uri.endswith(".tar.gz") and not uri.endswith("/"):
         uri += "/"
     if not uri.startswith(source_prefix):
@@ -303,21 +308,23 @@ def resolve_archive_uri(uri, source_prefix):
 
 
 def select_archives(s3, archive_uri, month_from, month_to):
-    """Return (sorted part file URIs, skipped non-date folder names).
+    """Return (sorted part file URIs, skipped non-date folder names, {uri: ETag}).
 
     archive_uri is one .tar.gz, or a folder whose children are YYYY-MM-DD
     folders (the monthly run date, e.g. 2026-01-01). A folder is selected when
     its month is within month_from..month_to; empty months mean every folder.
     Every .tar.gz part in a selected folder is included. Files directly in
-    archive_uri are included only when no month range is given.
+    archive_uri are included only when no month range is given. The ETags come
+    from the listing (no extra calls) and are used by the processed-file tracker.
     """
     bucket, prefix = split_uri(archive_uri)
     if prefix.endswith(".tar.gz"):
         if month_from or month_to:
             raise ValueError("--month_from/--month_to apply only when --archive_uri is a folder")
-        return [archive_uri], []
-    folders, direct = list_keys(s3, bucket, prefix, "/")
-    selected, skipped = [], []
+        _, objects = list_objects(s3, bucket, prefix)
+        return [archive_uri], [], {archive_uri: objects.get(prefix)}
+    folders, direct = list_objects(s3, bucket, prefix, "/")
+    selected, skipped = {}, []
     for folder in sorted(folders):
         name = folder[len(prefix):].rstrip("/")
         month = folder_month(name)
@@ -326,8 +333,9 @@ def select_archives(s3, archive_uri, month_from, month_to):
             continue
         if (month_from and month < month_from) or (month_to and month > month_to):
             continue
-        _, keys = list_keys(s3, bucket, folder, "/")
-        selected += [key for key in keys if key.endswith(".tar.gz")]
+        _, objects = list_objects(s3, bucket, folder, "/")
+        selected.update({key: etag for key, etag in objects.items() if key.endswith(".tar.gz")})
     if not month_from and not month_to:
-        selected += [key for key in direct if key.endswith(".tar.gz")]
-    return [f"s3://{bucket}/{key}" for key in sorted(selected)], skipped
+        selected.update({key: etag for key, etag in direct.items() if key.endswith(".tar.gz")})
+    etags = {f"s3://{bucket}/{key}": selected[key] for key in sorted(selected)}
+    return list(etags), skipped, etags

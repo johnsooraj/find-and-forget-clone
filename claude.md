@@ -32,3 +32,30 @@ If it matches, return "MATCH" along with the location of the data and transactio
 
 The second script delete will read the file location and know the transaction id (that table raw id, if we load data into spark data frame).
 The drop the record for the give list.
+
+
+-----------------------------------
+
+I wanted to redesign this project to a batch tool to perform multiple opeations, Strategy design pattern.
+
+Like in java we have interface and we can implementent multiple sevice in differnt form. Like wise, here we have find and forget as the  inerface layer and implementaion will be build based on the requirement.
+
+How I see the final product - during the piepline run, I will give required paramter and there should be a drop down to choose the behaviour or the batch process.
+Option 1. Pasrse the XML in given csv and perpare a results json which will have track of find summber to use at forget tool, based on the input hash.
+Option 2. I only want the result the trasaction id is end with _c, so i expect the result will be the path and trasaction id with _c in it, do not read the hash input, just read the file and pick the raw.
+
+So the overall project will be layered in 3. 
+
+Layer 1 - parse the input arguments for the second layer
+Layer 2 - actual find, based on the input option, perpare the map with transaction id _c OR read the input hash data and parse the xml and perpare the result
+Layer 3 - forget the give result data. It can have options like, should the orginal s3 file need to replaced by delete older or when upload new file apply a life cycle policy to older file version to delete automaticly
+
+I wanted a system to track the processed file records - to avoid the repeated execution.
+It can either a dynamodb table or Update the actual file tag with a marker.
+Befor the find process starts, make sure to check the flag.
+
+I would be needed a common email template to send notificatoion based on the events.
+Events like - after getting triggered from pipeline and at the end of finish, or during a error happened and the whole job stuck or killed.
+This part i will give more details later, just give placeholder everywhere.
+
+So the forget solution is only reading the result of the middle layer and perform the delete.

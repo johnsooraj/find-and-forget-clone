@@ -1,7 +1,7 @@
 {
   "batch_id": "drop-glue-find-42",
   "files": [
-    {"rows_expected": 2, "rows_removed": 2, "seconds": 41.7, "status": "DONE", "uri": "s3://data-lake/DBD001/archive/2026-01-01/AB_CDEFG_DATA_01_part_0001.tar.gz", "versions_deleted": 1},
+    {"new_etag": "\"7c9e1f0a2b3d4e5f60718293a4b5c6d7\"", "new_version_id": "Zp1Lk2Jh3Gf4Ds5Aq6Ws7Ed8Rf9Tg0Yh", "rows_expected": 2, "rows_removed": 2, "seconds": 41.7, "status": "DONE", "uri": "s3://data-lake/DBD001/archive/2026-01-01/AB_CDEFG_DATA_01_part_0001.tar.gz", "versions_deleted": 1},
     {"reason": "Already completed by an earlier run", "rows_expected": 1, "status": "SKIPPED", "uri": "s3://data-lake/DBD001/archive/2026-01-01/AB_CDEFG_DATA_01_part_0002.tar.gz"},
     {"rows_expected": 1, "status": "PENDING", "uri": "s3://data-lake/DBD001/archive/2026-02-01/AB_CDEFG_DATA_02_part_0417.tar.gz"}
   ],
@@ -10,8 +10,8 @@
   "files_pending": 1,
   "files_skipped": 1,
   "files_total": 3,
+  "forget_strategy": "REPLACE_PURGE_OLD_VERSIONS",
   "generated_at": "2026-11-16T17:40:03+00:00",
-  "purge_old_versions": true,
-  "schema_version": "3",
+  "schema_version": "4",
   "status": "IN_PROGRESS"
 }

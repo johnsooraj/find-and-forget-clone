@@ -40,24 +40,41 @@ def test_example_wave_round_trips():
         assert formats.wave_line(formats.parse_wave_line(line, number)) == json.loads(line)
 
 
+def test_example_suffix_results_match_builder():
+    example = load("results_suffix.json")
+    built = formats.suffix_result(example["tran_id_suffix"], example["match_result"], example["data_identifier"],
+                                  example.get("error"))
+    assert built == example
+
+
 def test_example_batch_matches_builder():
     example = load("batch.json")
-    built = formats.build_batch("B", "s3://j/i.json", '"e"', "s3://l/a/", "2026-01", "2026-03", "normalized", 1, [])
+    built = formats.build_batch("B", "HASH_MATCH", {"hash_mode": "normalized"}, "s3://j/i.json", '"e"', "s3://l/a/",
+                                "2026-01", "2026-03", 1, [], "HASH_MATCH#abc", 0)
     assert set(built) == set(example)
     assert formats.parse_batch(example, example["batch_id"]) == example
+
+
+def test_schema_3_batch_is_read_as_hash_match():
+    old = {"schema_version": "3", "batch_id": "B", "input_uri": "s3://j/i.json", "input_etag": '"e"',
+           "archive_uri": "s3://l/a/", "hash_mode": "raw", "files_total": 1}
+    batch = formats.parse_batch(old, "B")
+    assert batch["find_strategy"] == "HASH_MATCH" and batch["strategy_settings"] == {"hash_mode": "raw"}
+    assert batch["tracker_scope"] is None
 
 
 def test_example_summary_matches_builder():
     example = load("summary.json")
     batch = load("batch.json")
-    assert set(formats.build_summary("B", batch, formats.COMPLETE, 0, [], [], [])) == set(example)
+    counts = {"total": 4, "match": 2, "no_match": 1, "error": 1}
+    assert set(formats.build_summary("B", batch, formats.COMPLETE, 0, [], [], counts)) == set(example)
     in_progress = formats.build_summary("B", batch, formats.IN_PROGRESS, 0, [], [], None)
     assert set(in_progress) == set(example) and in_progress["requests_match"] is None
 
 
 def test_example_remove_summary_matches_builder():
     example = load("remove_summary.json")
-    built = formats.build_remove_summary("B", True, example["files"])
+    built = formats.build_remove_summary("B", "REPLACE_PURGE_OLD_VERSIONS", example["files"])
     assert set(built) == set(example)
     assert built["status"] == example["status"] == formats.IN_PROGRESS
 
@@ -70,7 +87,7 @@ def test_example_remove_summary_matches_builder():
 ])
 def test_remove_summary_status(statuses, expected):
     outcomes = [{"uri": str(i), "status": s} for i, s in enumerate(statuses)]
-    assert formats.build_remove_summary("B", False, outcomes)["status"] == expected
+    assert formats.build_remove_summary("B", "REPLACE_KEEP_VERSIONS", outcomes)["status"] == expected
 
 
 @pytest.mark.parametrize("document", [{}, "x", [], None])

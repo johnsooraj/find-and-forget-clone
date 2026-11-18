@@ -49,7 +49,9 @@ pipeline {
           if (fileExists('summary.json')) {
             def s = readJSON file: 'summary.json'
             echo "FIND ${s.status}: ${s.files_done} of ${s.files_total} part files done, ${s.files_failed} failed"
-            echo "  Months ${s.month_from ?: '(start)'} .. ${s.month_to ?: '(end)'}, hash_mode ${s.hash_mode}"
+            echo "  Strategy ${s.find_strategy ?: 'HASH_MATCH'} ${s.strategy_settings ?: [hash_mode: s.hash_mode]}"
+            echo "  Months ${s.month_from ?: '(start)'} .. ${s.month_to ?: '(end)'}"
+            echo "  Skipped by the processed-file tracker: ${s.files_skipped_tracked ?: 0} part files (already processed, unchanged)"
             echo "  So far: ${s.rows_to_delete} rows to delete in ${s.files_to_rewrite} part files"
             s.failed_files.each { f -> echo "  FAILED FILE ${f.uri}: ${f.error}" }
             if (s.status == 'COMPLETE') {
@@ -63,7 +65,7 @@ pipeline {
           }
           if (fileExists('remove_summary.json')) {
             def r = readJSON file: 'remove_summary.json'
-            echo "FORGET ${r.status}: ${r.files_done} done, ${r.files_skipped} skipped, ${r.files_failed} failed, ${r.files_pending} pending (of ${r.files_total})"
+            echo "FORGET ${r.status} (${r.forget_strategy ?: (r.purge_old_versions ? 'REPLACE_PURGE_OLD_VERSIONS' : 'REPLACE_KEEP_VERSIONS')}): ${r.files_done} done, ${r.files_skipped} skipped, ${r.files_failed} failed, ${r.files_pending} pending (of ${r.files_total})"
             r.files.each { f ->
               if (f.status == 'FAILED') { echo "  FAILED ${f.uri}: ${f.error}" }
             }

@@ -1,0 +1,10 @@
+{
+  "data_identifier": {
+    "s3://data-lake/DBD001/archive/2026-01-01/AB_CDEFG_DATA_01_part_0001.tar.gz": ["100231_c", "100245_c"],
+    "s3://data-lake/DBD001/archive/2026-02-01/AB_CDEFG_DATA_02_part_0417.tar.gz": ["200877_c"]
+  },
+  "find_strategy": "TRAN_ID_SUFFIX",
+  "match_count": 3,
+  "match_result": "MATCH",
+  "tran_id_suffix": "_c"
+}

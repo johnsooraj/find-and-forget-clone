@@ -5,7 +5,7 @@ import pytest
 
 import common
 import find
-import tasks
+import find_strategies
 from conftest import (
     ADDRESS, F1, INPUT, J1, J2, M1, PHONE, SOURCE, base, find_args, find_outputs, hashed, item, local_runner,
     run_find, uri_of,
@@ -61,7 +61,7 @@ def test_no_valid_items_scans_nothing(s3):
 
 
 def test_raw_hash_mode_hashes_the_exact_text(s3):
-    raw_item = {"run_id": "raw", "hash_value": tasks.sha256_hex("JANE.DOE@example.com"), "match_type": "EMAIL"}
+    raw_item = {"run_id": "raw", "hash_value": common.sha256_hex("JANE.DOE@example.com"), "match_type": "EMAIL"}
     # The XML holds "1 MAIN ST, Springfield": only its exact text matches in raw mode.
     s3.put(INPUT, json.dumps([raw_item, item("norm", ADDRESS, "ADDRESS")]).encode())
     _, results, _ = complete(s3, hash_mode="raw")
@@ -136,7 +136,7 @@ def test_retry_failed_rescans_after_fix(s3):
 
 def test_doctype_rejected():
     with pytest.raises(ValueError, match="document types"):
-        tasks.find_hits('<!DOCTYPE x [<!ENTITY e "y">]><a/>', {}, {}, "normalized")
+        find_strategies.find_hits('<!DOCTYPE x [<!ENTITY e "y">]><a/>', {}, {}, "normalized")
 
 
 @pytest.mark.parametrize("batch_id", ["", "has space", "x" * 129])
@@ -158,7 +158,7 @@ def test_bad_batch_id_rejected(s3, batch_id):
     ],
 )
 def test_select_archives_by_month(s3, month_from, month_to, expected):
-    uris, skipped = common.select_archives(s3, SOURCE, month_from, month_to)
+    uris, skipped, _ = common.select_archives(s3, SOURCE, month_from, month_to)
     assert uris == [uri_of(p) for p in expected]
     assert skipped == ["misc"]
 
@@ -208,4 +208,4 @@ def test_hash_helper_matches_known_value():
 def test_parse_args_reads_glue_style_arguments():
     args = find.parse_args(["--region", "us-east-1", "--source_prefix", SOURCE, "--result_prefix", "s3://j/r/",
                             "--stop_uri", "s3://j/c/STOP", "--batch_id", "B", "--JOB_ID", "x", "--month_from", "2026-01"])
-    assert args.batch_id == "B" and args.month_from == "2026-01" and args.files_per_wave == "100"
+    assert args.batch_id == "B" and args.month_from == "2026-01" and args.files_per_wave == 100

@@ -12,8 +12,8 @@ from typing import Dict, List, Optional, Set
 
 from common import now
 
-SCHEMA_VERSION = "3"
-SUPPORTED_SCHEMA_VERSIONS = {"3"}
+SCHEMA_VERSION = "4"
+SUPPORTED_SCHEMA_VERSIONS = {"3", "4"}  # 3 = before strategies (always HASH_MATCH)
 MATCH_TYPES = ("EMAIL", "PHONE", "NAME", "ADDRESS")
 MATCH, NO_MATCH, ERROR = "MATCH", "NO_MATCH", "ERROR"
 IN_PROGRESS, COMPLETE, INCOMPLETE = "IN_PROGRESS", "COMPLETE", "INCOMPLETE"
@@ -22,12 +22,13 @@ HASH = re.compile(r"[0-9A-Fa-f]{64}")
 RUN_ID = re.compile(r"[A-Za-z0-9_.:-]{1,128}")
 ETAG = re.compile(r'"[A-Fa-f0-9]+(?:-[0-9]+)?"')
 MAX_REQUESTS = 100_000
+LEGACY_STRATEGY = "HASH_MATCH"
 
 
 # ----------------------------------------------------------------------------- internal structures
 @dataclass
 class Request:
-    """One input item. `error` is set when the item itself is invalid."""
+    """One input item (HASH_MATCH). `error` is set when the item itself is invalid."""
 
     index: int
     run_id: object  # echoed back exactly as given
@@ -48,7 +49,7 @@ class FileHits:
     run_ids: Set[str] = field(default_factory=set)
 
 
-# ----------------------------------------------------------------------------- input
+# ----------------------------------------------------------------------------- input (HASH_MATCH)
 def parse_input(document) -> List[Request]:
     """Input: [{"run_id", "hash_value", "match_type"}, ...].
 
@@ -82,51 +83,66 @@ def parse_input(document) -> List[Request]:
 
 
 # ----------------------------------------------------------------------------- batch.json (find, first run)
-def build_batch(batch_id, input_uri, input_etag, archive_uri, month_from, month_to, hash_mode,
-                files_total, skipped_folders) -> dict:
+def build_batch(batch_id, find_strategy, strategy_settings, input_uri, input_etag, archive_uri, month_from,
+                month_to, files_total, skipped_folders, tracker_scope, files_skipped_tracked) -> dict:
     """Fixed settings of a batch. Later runs must use the same values."""
     return {
         "schema_version": SCHEMA_VERSION,
         "batch_id": batch_id,
         "created_at": now(),
+        "find_strategy": find_strategy,
+        "strategy_settings": strategy_settings,
         "input_uri": input_uri,
         "input_etag": input_etag,
         "archive_uri": archive_uri,
         "month_from": month_from,
         "month_to": month_to,
-        "hash_mode": hash_mode,
         "files_total": files_total,
+        "files_skipped_tracked": files_skipped_tracked,
         "skipped_folders": skipped_folders,
+        "tracker_scope": tracker_scope,
     }
 
 
 def parse_batch(document, batch_id) -> dict:
+    """Return batch.json; a schema 3 batch is upgraded in memory to HASH_MATCH."""
     if not isinstance(document, dict):
         raise ValueError("batch.json must be a JSON object")
     _check_schema(document, "batch.json")
     if document.get("batch_id") != batch_id:
         raise ValueError("batch.json batch_id does not match")
-    for key in ("input_uri", "input_etag", "archive_uri", "hash_mode", "files_total"):
+    document = dict(document)
+    if document.get("schema_version") == "3":
+        document.setdefault("find_strategy", LEGACY_STRATEGY)
+        document.setdefault("strategy_settings", {"hash_mode": document.get("hash_mode")})
+        document.setdefault("tracker_scope", None)
+        document.setdefault("files_skipped_tracked", 0)
+    for key in ("find_strategy", "strategy_settings", "input_uri", "input_etag", "archive_uri", "files_total"):
         if key not in document:
             raise ValueError(f"batch.json is missing {key}")
     return document
 
 
 # ----------------------------------------------------------------------------- selected_files.jsonl
-def selected_line(uri) -> dict:
-    return {"uri": uri}
+def selected_line(uri, etag=None, tracked=False) -> dict:
+    """tracked = the processed-file tracker says this file needs no scan in this batch."""
+    return {"uri": uri, "etag": etag, "tracked": bool(tracked)}
 
 
-def parse_selected_line(line) -> str:
+def parse_selected_line(line) -> dict:
     entry = json.loads(line)
     if not isinstance(entry, dict) or not isinstance(entry.get("uri"), str):
         raise ValueError("Invalid selected_files.jsonl line")
-    return entry["uri"]
+    return {"uri": entry["uri"], "etag": entry.get("etag"), "tracked": bool(entry.get("tracked"))}
 
 
 # ----------------------------------------------------------------------------- waves/wave-NNNNN.jsonl
 def wave_line(outcome) -> dict:
-    """One scanned file. outcome comes from tasks.scan_task."""
+    """One scanned file. outcome comes from tasks.scan_task.
+
+    matches: {strategy match key: [TRAN_ID, ...]}. The key is the input item
+    index for HASH_MATCH and "SUFFIX" for TRAN_ID_SUFFIX.
+    """
     return {
         "schema_version": SCHEMA_VERSION,
         "uri": outcome["uri"],
@@ -137,12 +153,13 @@ def wave_line(outcome) -> dict:
         "rows": outcome.get("rows"),
         "seconds": outcome.get("seconds"),
         "error": outcome.get("error"),
-        "matches": {str(index): sorted(ids) for index, ids in sorted(outcome.get("matches", {}).items())},
+        "matches": {str(key): sorted(ids) for key, ids in sorted(outcome.get("matches", {}).items(),
+                                                                   key=lambda kv: str(kv[0]))},
     }
 
 
 def parse_wave_line(line, where) -> dict:
-    """Return the outcome with matches keyed by input index (int)."""
+    """Return the outcome with matches keyed by the match key (str)."""
     try:
         entry = json.loads(line)
     except json.JSONDecodeError:
@@ -151,17 +168,31 @@ def parse_wave_line(line, where) -> dict:
         raise ValueError(f"{where}: invalid wave line")
     _check_schema(entry, where)
     matches = entry.get("matches") or {}
-    entry["matches"] = {int(index): list(ids) for index, ids in matches.items()}
+    entry["matches"] = {str(key): list(ids) for key, ids in matches.items()}
     return entry
 
 
 # ----------------------------------------------------------------------------- results.json
 def result_entry(request: Request, match_result: str, data_identifier: Dict[str, List[str]], error=None) -> dict:
-    """One element of results.json. data_identifier: {s3 uri: [TRAN_ID, ...]}."""
+    """HASH_MATCH: one element of results.json. data_identifier: {s3 uri: [TRAN_ID, ...]}."""
     entry = {
         "run_id": request.run_id,
         "hash_value": request.hash_value,
         "match_type": request.match_type,
+        "match_result": match_result,
+        "match_count": sum(len(ids) for ids in data_identifier.values()),
+        "data_identifier": {uri: sorted(ids) for uri, ids in sorted(data_identifier.items())},
+    }
+    if error:
+        entry["error"] = error
+    return entry
+
+
+def suffix_result(tran_id_suffix, match_result, data_identifier: Dict[str, List[str]], error=None) -> dict:
+    """TRAN_ID_SUFFIX: the whole results.json (there is no input, so one document)."""
+    entry = {
+        "find_strategy": "TRAN_ID_SUFFIX",
+        "tran_id_suffix": tran_id_suffix,
         "match_result": match_result,
         "match_count": sum(len(ids) for ids in data_identifier.values()),
         "data_identifier": {uri: sorted(ids) for uri, ids in sorted(data_identifier.items())},
@@ -208,31 +239,34 @@ def parse_file_line(line: str, number: int) -> FileHits:
 
 
 # ----------------------------------------------------------------------------- summary.json (find)
-def build_summary(batch_id, batch, status, files_done, failed_files, file_hits, results) -> dict:
+def build_summary(batch_id, batch, status, files_done, failed_files, file_hits, request_counts) -> dict:
     """Progress and counts shown by the Jenkins status pipeline. No customer data.
 
-    While IN_PROGRESS, results is None and the request counts are null.
+    request_counts: {"total", "match", "no_match", "error"} from the strategy,
+    or None while IN_PROGRESS (the request counts are then null).
     """
-    complete = results is not None
+    counts = request_counts or {}
     return {
         "schema_version": SCHEMA_VERSION,
         "batch_id": batch_id,
         "status": status,
         "generated_at": now(),
+        "find_strategy": batch["find_strategy"],
+        "strategy_settings": batch["strategy_settings"],
         "archive_uri": batch["archive_uri"],
         "month_from": batch.get("month_from"),
         "month_to": batch.get("month_to"),
-        "hash_mode": batch["hash_mode"],
         "files_total": batch["files_total"],
         "files_done": files_done,
+        "files_skipped_tracked": batch.get("files_skipped_tracked", 0),
         "files_failed": len(failed_files),
         "failed_files": failed_files,
         "files_to_rewrite": len(file_hits),
         "rows_to_delete": sum(len(hits.tran_ids) for hits in file_hits),
-        "requests_total": len(results) if complete else None,
-        "requests_match": sum(r["match_result"] == MATCH for r in results) if complete else None,
-        "requests_no_match": sum(r["match_result"] == NO_MATCH for r in results) if complete else None,
-        "requests_error": sum(r["match_result"] == ERROR for r in results) if complete else None,
+        "requests_total": counts.get("total"),
+        "requests_match": counts.get("match"),
+        "requests_no_match": counts.get("no_match"),
+        "requests_error": counts.get("error"),
         "skipped_folders": batch.get("skipped_folders", []),
     }
 
@@ -247,7 +281,7 @@ def parse_summary(document, batch_id) -> dict:
 
 
 # ----------------------------------------------------------------------------- remove_summary.json (forget)
-def build_remove_summary(batch_id, purge, outcomes) -> dict:
+def build_remove_summary(batch_id, forget_strategy, outcomes) -> dict:
     """outcomes: one per file in files.jsonl, status DONE / SKIPPED / FAILED / PENDING."""
     count = {s: sum(o["status"] == s for o in outcomes) for s in ("DONE", "SKIPPED", "FAILED", "PENDING")}
     if count["FAILED"]:
@@ -261,7 +295,7 @@ def build_remove_summary(batch_id, purge, outcomes) -> dict:
         "batch_id": batch_id,
         "status": status,
         "generated_at": now(),
-        "purge_old_versions": purge,
+        "forget_strategy": forget_strategy,
         "files_total": len(outcomes),
         "files_done": count["DONE"],
         "files_skipped": count["SKIPPED"],

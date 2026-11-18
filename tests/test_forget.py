@@ -4,6 +4,7 @@ import json
 import pytest
 
 import forget
+import forget_strategies
 import tasks
 from conftest import (
     ARCHIVES, EMAIL, F1, INPUT, J1, J2, M1, NAME, PHONE, RESULTS, FakeS3, add_archives, base, forget_args, item,
@@ -79,7 +80,7 @@ def test_content_type_and_metadata_kept_and_batch_tagged(s3):
 
 def test_purge_deletes_old_versions(s3):
     found_and_cleared(s3)
-    report, error = run_forget(s3, purge_old_versions="true")
+    report, error = run_forget(s3, forget_strategy="REPLACE_PURGE_OLD_VERSIONS")
     assert error is None
     for path in EXPECTED_LEFT:
         assert len(s3.versions(uri_of(path))) == 1
@@ -136,17 +137,17 @@ def test_killed_after_put_is_recovered_without_rewriting(s3, monkeypatch):
 
 def test_failed_purge_resumes_on_rerun(s3, monkeypatch):
     found_and_cleared(s3)
-    original = tasks.purge_old_versions
+    original = forget_strategies.purge_old_versions
 
     def broken(*args, **kwargs):
         raise RuntimeError("throttled")
 
-    monkeypatch.setattr(tasks, "purge_old_versions", broken)
-    report, error = run_forget(s3, purge_old_versions="true")
+    monkeypatch.setattr(forget_strategies, "purge_old_versions", broken)
+    report, error = run_forget(s3, forget_strategy="REPLACE_PURGE_OLD_VERSIONS")
     assert error is not None and report["files_failed"] == 4
-    monkeypatch.setattr(tasks, "purge_old_versions", original)
+    monkeypatch.setattr(forget_strategies, "purge_old_versions", original)
     s3.put_log.clear()
-    report, error = run_forget(s3, purge_old_versions="true")
+    report, error = run_forget(s3, forget_strategy="REPLACE_PURGE_OLD_VERSIONS")
     assert error is None and report["files_done"] == 4
     assert source_puts(s3) == []  # rows were already removed; only the purge ran
     for path in EXPECTED_LEFT:
@@ -158,7 +159,7 @@ def test_unversioned_bucket():
     add_archives(s3, {J1: ARCHIVES[J1]})
     s3.put(INPUT, json.dumps([item("p", PHONE, "PHONE")]).encode())
     run_find(s3)
-    report, error = run_forget(s3, purge_old_versions="true")
+    report, error = run_forget(s3, forget_strategy="REPLACE_PURGE_OLD_VERSIONS")
     assert error is None and report["files"][0]["versions_deleted"] == 0
 
 
