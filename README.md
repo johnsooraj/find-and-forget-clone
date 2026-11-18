@@ -40,6 +40,9 @@ Shared   processed-file tracker (DynamoDB | S3 tag), notifications (placeholder)
 | `examples/` | Sample input and outputs (kept in sync by the tests) |
 | `tests/` | `pytest tests/`, which runs locally without AWS or Spark |
 | `docs/GUIDE.md` | The guide |
+| `docs/COST_ESTIMATE.md` | AWS cost estimates per scenario, the formulas, and a log of measured runs |
+| `docs/COMPARISON_GLUE_VS_STEP_FUNCTIONS.md` | Cost, duration and trade-offs of Step Functions + Lambda vs Glue for `_c` mode |
+| `docs/SCENARIO_3_MONTHS_TRAN_ID_SUFFIX.md` | Worked scenario: `_c` mode on 3 months × 800 files (waves, runs, duration, cost; 1 month vs 3 months) |
 
 ## Quick start
 
