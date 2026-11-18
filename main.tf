@@ -1,24 +1,24 @@
 # drop-glue: one module per resource (see modules/).
 #
-#   module.scripts              modules/s3-scripts        the Python scripts in the job bucket
+#   module.job_bucket           modules/s3-bucket         the job bucket <job_bucket>-<workspace>
 #   module.tracker              modules/dynamodb-table    processed-file tracker (tracker = DYNAMODB)
 #   module.role["find|forget"]  modules/iam-role          one least-privilege role + policy per job
 #   module.job["find|forget"]   modules/glue-job          the Glue Spark jobs (+ their log groups)
 #   module.source_lifecycle     modules/s3-lifecycle      optional: expire superseded versions
 #   module.glue_failure_alerts  modules/eventbridge-rule  optional: failed/killed runs -> SNS (placeholder)
 #
-# Per environment:  backend/<env>.s3.tfbackend  +  tfvars/<env>.tfvars  (see docs/GUIDE.md, 7.2)
+# Per environment:  workspace <env>  +  backend/<env>.s3.tfbackend  +  tfvars/<env>.tfvars  (docs/GUIDE.md, 7.2)
+# Every name ends in -${terraform.workspace} (local.suffix in locals.tf), incl. the job bucket.
+# Provisioned by ./Jenkinsfile, which also copies scripts/*.py into the job bucket (COPY_SCRIPTS).
 
-module "scripts" {
-  source = "./modules/s3-scripts"
+module "job_bucket" {
+  source = "./modules/s3-bucket"
 
-  bucket        = var.job_bucket
-  key_prefix    = "${local.job_prefix}scripts/"
-  job_prefix    = local.job_prefix
-  source_dir    = "${path.root}/scripts"
-  names         = local.script_names
-  source_bucket = var.source_bucket
-  source_prefix = var.source_prefix
+  name                    = local.job_bucket
+  force_destroy           = var.job_bucket_force_destroy
+  noncurrent_version_days = var.job_bucket_noncurrent_version_days
+  expire_prefixes         = ["${local.job_prefix}requests/", "${local.job_prefix}results/"]
+  expire_days             = var.report_retention_days
 }
 
 module "tracker" {
@@ -35,7 +35,7 @@ module "role" {
   for_each = toset(keys(local.jobs))
   source   = "./modules/iam-role"
 
-  name             = "${var.name}-${each.key}"
+  name             = "${var.name}-${each.key}${local.suffix}"
   read_arns        = concat([local.scripts_arn], local.jobs[each.key].read)
   write_arns       = local.jobs[each.key].write
   extra_statements = local.jobs[each.key].extra_statements
@@ -45,9 +45,9 @@ module "job" {
   for_each = toset(keys(local.jobs))
   source   = "./modules/glue-job"
 
-  name               = "${var.name}-${each.key}"
+  name               = "${var.name}-${each.key}${local.suffix}"
   role_arn           = module.role[each.key].arn
-  script_uri         = module.scripts.uris[each.key]
+  script_uri         = "${local.scripts_prefix}${each.key}.py"
   timeout            = local.jobs[each.key].timeout
   worker_type        = var.worker_type
   number_of_workers  = var.default_workers
@@ -55,7 +55,7 @@ module "job" {
   default_arguments  = local.default_arguments
   log_retention_days = var.log_retention_days
 
-  depends_on = [module.scripts] # the shared modules must exist before the jobs run
+  depends_on = [module.job_bucket]
 }
 
 module "source_lifecycle" {
@@ -65,7 +65,7 @@ module "source_lifecycle" {
   source = "./modules/s3-lifecycle"
 
   bucket          = var.source_bucket
-  rule_id         = "drop-glue-expire-superseded-versions"
+  rule_id         = "drop-glue-expire-superseded-versions${local.suffix}"
   prefix          = var.source_prefix
   tags            = { "drop-glue-superseded" = "true" }
   noncurrent_days = var.superseded_version_days
@@ -78,7 +78,7 @@ module "glue_failure_alerts" {
   count  = var.notification_topic_arn == "" ? 0 : 1
   source = "./modules/eventbridge-rule"
 
-  name        = "${var.name}-glue-job-state"
+  name        = "${var.name}-job-state${local.suffix}"
   description = "drop-glue Find/Forget runs that FAILED, TIMED OUT, were STOPPED or hit an ERROR"
   target_arn  = var.notification_topic_arn
   event_pattern = jsonencode({

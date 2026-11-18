@@ -24,10 +24,10 @@ pipeline {
     string(name: 'MAX_WAVES', defaultValue: '', description: 'Waves in this run before it stops (0 = no limit). Empty = Terraform default (5).')
     string(name: 'WORKERS', defaultValue: '', description: 'Glue workers incl. 1 driver; each G.1X worker rewrites 4 parts at once. Empty = Terraform default (26).')
     string(name: 'AWS_REGION', defaultValue: 'us-east-1', description: 'Region of the Glue jobs')
-    string(name: 'GLUE_JOB', defaultValue: 'drop-glue-forget', description: 'terraform output job_names.forget')
+    string(name: 'GLUE_JOB', defaultValue: 'drop-glue-forget-prod', description: 'terraform output job_names.forget (ends in -<workspace>)')
     string(name: 'WORKER_TYPE', defaultValue: 'G.1X', description: 'Must match the Terraform worker_type')
-    string(name: 'RESULT_PREFIX', defaultValue: 's3://JOB_BUCKET/drop-glue/results/', description: 'terraform output result_prefix')
-    string(name: 'STOP_URI', defaultValue: 's3://JOB_BUCKET/drop-glue/control/STOP', description: 'terraform output stop_uri')
+    string(name: 'RESULT_PREFIX', defaultValue: 's3://JOB_BUCKET-prod/drop-glue/results/', description: 'terraform output result_prefix')
+    string(name: 'STOP_URI', defaultValue: 's3://JOB_BUCKET-prod/drop-glue/control/STOP', description: 'terraform output stop_uri')
   }
 
   stages {

@@ -25,9 +25,9 @@ Shared   processed-file tracker (DynamoDB | S3 tag), notifications (placeholder)
 | Path | What it is |
 |---|---|
 | `main.tf`, `locals.tf`, `variables.tf`, `outputs.tf`, `versions.tf`, `moved.tf` | Terraform root: wires the modules together (S3 backend, partial config) |
-| `modules/` | One module per resource: `s3-scripts`, `iam-role`, `glue-job` (+ its log group), `dynamodb-table`, `s3-lifecycle`, `eventbridge-rule` |
-| `backend/<env>.s3.tfbackend` | S3 state bucket, key and locking per environment (stage, prod) |
-| `tfvars/<env>.tfvars` | Variables per environment (stage, prod); `tfvars/example.tfvars` lists every variable |
+| `modules/` | One module per resource: `s3-bucket` (job bucket), `iam-role`, `glue-job` (+ its log group), `dynamodb-table`, `s3-lifecycle`, `eventbridge-rule` |
+| `backend/<env>.s3.tfbackend` | S3 state bucket, workspace prefix and locking per environment (prod, stage, uat) |
+| `tfvars/<env>.tfvars` | Variables per environment (prod, stage, uat), used in the workspace of the same name; `tfvars/example.tfvars` lists every variable |
 | `scripts/arguments.py` | Layer 1: argument parsing and validation (`FindConfig`, `ForgetConfig`) |
 | `scripts/find.py`, `scripts/find_strategies.py` | Layer 2: Find driver (batches, waves, reports) and the find strategies |
 | `scripts/forget.py`, `scripts/forget_strategies.py` | Layer 3: Forget driver (waves, markers, remove summary) and the forget strategies |
@@ -36,7 +36,8 @@ Shared   processed-file tracker (DynamoDB | S3 tag), notifications (placeholder)
 | `scripts/notify.py` | Common notification template and senders (placeholder) |
 | `scripts/common.py` | Shared S3, archive, month selection, stop switch and runner helpers |
 | `scripts/formats.py` | All input and report JSON layouts (edit here when formats change) |
-| `jenkins/Jenkinsfile.{find,status,forget,stop}` | The four pipelines (fire-and-forget) |
+| `Jenkinsfile` | **Provisioning** pipeline: branch, workspace, apply/destroy (+ `DESTROY_ALL`), optional `COPY_SCRIPTS` |
+| `jenkins/Jenkinsfile.{find,status,forget,stop}` | The four find-and-forget pipelines (fire-and-forget), used only to run batches |
 | `examples/` | Sample input and outputs (kept in sync by the tests) |
 | `tests/` | `pytest tests/`, which runs locally without AWS or Spark |
 | `docs/GUIDE.md` | The guide |
@@ -46,17 +47,11 @@ Shared   processed-file tracker (DynamoDB | S3 tag), notifications (placeholder)
 
 ## Quick start
 
-```text
-# edit backend/stage.s3.tfbackend (state bucket + key) and tfvars/stage.tfvars (buckets, region, name)
-terraform init -reconfigure -backend-config=backend/stage.s3.tfbackend
-terraform plan  -var-file=tfvars/stage.tfvars -out=stage.tfplan
-terraform apply stage.tfplan
-terraform output
-```
+1. Edit `backend/<env>.s3.tfbackend` (state bucket) and `tfvars/<env>.tfvars` (environment, job bucket base name, archive bucket, region), and commit them.
+2. Create a Jenkins job `drop-glue-provision` from the root **`Jenkinsfile`**, set its environment variables `ROLE_NAME`, `ROLE_ACCOUNT`, `EXTERNAL_ID`, `AWS_REGION` and `NOTIFICATION_EMAIL` (every AWS call runs under `withAWS` with that role), and build it with `BRANCH`, `TERRAFORM_WORKSPACE=stage` and `ACTION=apply`. It creates the job bucket `<job_bucket>-stage`, the Glue jobs, roles, log groups and tracker table, and on the first run copies `scripts/*.py` into the bucket. Tick `COPY_SCRIPTS` on later runs when the scripts change. `ACTION=destroy` requires `DESTROY_ALL`. Every build stops for a 10-minute approval after the plan, and `prod` first asks for a change request number.
+3. Every resource name ends in the workspace, e.g. `drop-glue-find-prod` and `abcd-job-data-prod` ([guide 7.2](docs/GUIDE.md#72-deploy)).
 
-Use `backend/prod.s3.tfbackend` + `tfvars/prod.tfvars` for prod ([guide 7.2](docs/GUIDE.md#72-deploy)).
-
-Then create the four Jenkins jobs from `jenkins/`, agree the hashing rule ([guide section 4](docs/GUIDE.md#4-how-hashing-works)), run a pilot to size the throttling ([section 5](docs/GUIDE.md#5-throttling-and-sizing)) and follow [section 8](docs/GUIDE.md#8-step-1-find).
+Then create the four find-and-forget Jenkins jobs from `jenkins/` with the defaults the provisioning build prints, agree the hashing rule ([guide section 4](docs/GUIDE.md#4-how-hashing-works)), run a pilot to size the throttling ([section 5](docs/GUIDE.md#5-throttling-and-sizing)) and follow [section 8](docs/GUIDE.md#8-step-1-find).
 
 ## Defaults (all configurable)
 

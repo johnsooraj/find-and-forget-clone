@@ -1,10 +1,14 @@
 # S3 remote state for PROD.
 #   terraform init -reconfigure -backend-config=backend/prod.s3.tfbackend
+#   terraform workspace select -or-create prod
 #
 # The state bucket is a SEPARATE, existing bucket: not the data lake bucket
 # and not the Glue job bucket. Turn on versioning and default encryption on it.
-bucket       = "your-terraform-state-bucket-prod"
-key          = "drop-glue/prod/terraform.tfstate"
-region       = "us-east-1"
-encrypt      = true
-use_lockfile = true # S3 native locking (Terraform >= 1.10); no DynamoDB lock table needed
+# State object: s3://<bucket>/<workspace_key_prefix>/<workspace>/<key>
+#             = s3://your-terraform-state-bucket-prod/drop-glue/prod/terraform.tfstate
+bucket               = "your-terraform-state-bucket-prod"
+workspace_key_prefix = "drop-glue"
+key                  = "terraform.tfstate"
+region               = "us-east-1"
+encrypt              = true
+use_lockfile         = true # S3 native locking (Terraform >= 1.10); no DynamoDB lock table needed

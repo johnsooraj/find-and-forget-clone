@@ -1,6 +1,6 @@
-# Keeps an existing deployment (made before the one-module-per-resource layout)
-# from being destroyed and recreated. Safe to delete once every environment
-# has been applied with this layout.
+# Keeps an existing deployment (made with an older layout) from being
+# destroyed and recreated. Safe to delete once every environment has been
+# applied with this layout.
 
 # The shared /aws-glue/jobs/{output,error,logs-v2} log groups (old manage_log_groups)
 # are used by every Glue job in the account: forget them, never delete them.
@@ -13,9 +13,22 @@ removed {
   }
 }
 
-moved {
+# Scripts are no longer Terraform objects: the provisioning pipeline copies them
+# (./Jenkinsfile, COPY_SCRIPTS). Forget the old objects without deleting them.
+removed {
   from = aws_s3_object.scripts
-  to   = module.scripts.aws_s3_object.this
+
+  lifecycle {
+    destroy = false
+  }
+}
+
+removed {
+  from = module.scripts
+
+  lifecycle {
+    destroy = false
+  }
 }
 
 moved {

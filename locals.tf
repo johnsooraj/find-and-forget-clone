@@ -1,24 +1,35 @@
 data "aws_partition" "current" {}
 
 locals {
+  # ------------------------------------------------------------ environment postfix
+  # Every name this project creates ends in -<workspace>: drop-glue-find-prod,
+  # /aws-glue/jobs/drop-glue-find-prod, drop-glue-processed-files-prod, and the
+  # job bucket <job_bucket>-prod. Guarded in outputs.tf (output "environment").
+  environment = terraform.workspace
+  suffix      = "-${local.environment}"
+  job_bucket  = "${var.job_bucket}${local.suffix}"
+
   s3_arn            = "arn:${data.aws_partition.current.partition}:s3:::"
   source_bucket_arn = "${local.s3_arn}${var.source_bucket}"
-  job_bucket_arn    = "${local.s3_arn}${var.job_bucket}"
+  job_bucket_arn    = "${local.s3_arn}${local.job_bucket}"
   job_prefix        = "drop-glue/"
   source_arn        = "${local.source_bucket_arn}/${var.source_prefix}*"
   request_arn       = "${local.job_bucket_arn}/${local.job_prefix}requests/*"
   result_arn        = "${local.job_bucket_arn}/${local.job_prefix}results/*"
   scripts_arn       = "${local.job_bucket_arn}/${local.job_prefix}scripts/*"
-  result_prefix     = "s3://${var.job_bucket}/${local.job_prefix}results/"
-  stop_uri          = "s3://${var.job_bucket}/${local.job_prefix}control/STOP"
+  result_prefix     = "s3://${local.job_bucket}/${local.job_prefix}results/"
+  stop_uri          = "s3://${local.job_bucket}/${local.job_prefix}control/STOP"
 
   # ------------------------------------------------------------ scripts
+  # Terraform does NOT upload the scripts: the provisioning pipeline (./Jenkinsfile,
+  # COPY_SCRIPTS) copies scripts/*.py to this fixed prefix. The jobs read them
+  # from here at the start of every run.
   #   layer 1: arguments   layer 2: find, find_strategies   layer 3: forget, forget_strategies
   #   shared:  common, formats, tasks, tracking, notify
+  scripts_prefix = "s3://${local.job_bucket}/${local.job_prefix}scripts/"
   shared_modules = ["arguments", "common", "formats", "tasks", "find_strategies", "forget_strategies", "tracking", "notify"]
-  script_names   = concat(["find", "forget"], local.shared_modules)
   # Modules shipped to the driver and every Spark executor.
-  extra_py_files = join(",", [for name in local.shared_modules : module.scripts.uris[name]])
+  extra_py_files = join(",", [for name in local.shared_modules : "${local.scripts_prefix}${name}.py"])
 
   # ------------------------------------------------------------ S3 permissions
   # Listing is limited by an s3:prefix condition.
@@ -55,7 +66,7 @@ locals {
   }] : []
 
   # ------------------------------------------------------------ processed-file tracker
-  tracker_table = var.tracker_table_name != "" ? var.tracker_table_name : "${var.name}-processed-files"
+  tracker_table = "${var.tracker_table_name != "" ? var.tracker_table_name : "${var.name}-processed-files"}${local.suffix}"
   tracker_arguments = {
     for key, value in {
       "--tracker"       = var.tracker

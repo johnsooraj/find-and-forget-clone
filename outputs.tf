@@ -1,3 +1,37 @@
+output "environment" {
+  description = "The workspace: the -<postfix> of every resource name in this deployment."
+  value       = local.environment
+
+  # A failed precondition fails the plan, so nothing is created under a wrong name.
+  precondition {
+    condition     = contains(var.environments, terraform.workspace)
+    error_message = "Workspace '${terraform.workspace}' is not one of ${join(", ", var.environments)}. Run: terraform workspace select -or-create <env> (the default workspace is not allowed)."
+  }
+  precondition {
+    condition     = var.environment == terraform.workspace
+    error_message = "The tfvars file is for '${var.environment}' but the workspace is '${terraform.workspace}'. Use -var-file=tfvars/${terraform.workspace}.tfvars or select the matching workspace."
+  }
+  precondition {
+    condition     = var.source_bucket != local.job_bucket
+    error_message = "The archive bucket and the job bucket must be different buckets."
+  }
+}
+
+output "region" {
+  description = "Region of the deployment (used by the provisioning pipeline to copy the scripts)."
+  value       = var.region
+}
+
+output "job_bucket" {
+  description = "The job bucket created for this environment (<job_bucket>-<workspace>)."
+  value       = module.job_bucket.name
+}
+
+output "scripts_prefix" {
+  description = "Where the provisioning pipeline copies scripts/*.py (COPY_SCRIPTS); the jobs load them from here."
+  value       = local.scripts_prefix
+}
+
 output "job_names" {
   description = "Glue job names to configure in the Jenkins pipelines."
   value       = { for phase, job in module.job : phase => job.name }
@@ -15,7 +49,7 @@ output "role_arns" {
 
 output "request_prefix" {
   description = "Where Jenkins (or people) upload input files."
-  value       = "s3://${var.job_bucket}/${local.job_prefix}requests/"
+  value       = "s3://${local.job_bucket}/${local.job_prefix}requests/"
 }
 
 output "result_prefix" {

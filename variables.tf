@@ -20,18 +20,57 @@ variable "source_prefix" {
 }
 
 variable "job_bucket" {
-  description = "Existing bucket for the scripts, input files, reports and stop switch (under drop-glue/)."
+  description = "Base name of the job bucket CREATED by this project (scripts, input files, reports, stop switch under drop-glue/). The workspace is appended: abcd-job-data -> abcd-job-data-prod. Bucket names are global, so pick a unique base."
   type        = string
+
+  validation {
+    condition     = can(regex("^[a-z0-9][a-z0-9-]{1,50}[a-z0-9]$", var.job_bucket))
+    error_message = "job_bucket must be 3-52 lowercase letters, digits or hyphens (the -<workspace> postfix is added)."
+  }
+}
+
+variable "job_bucket_force_destroy" {
+  description = "Let Terraform delete the job bucket with every object and version in it. Leave false: the provisioning pipeline sets it only for ACTION=destroy with DESTROY_ALL."
+  type        = bool
+  default     = false
+}
+
+variable "job_bucket_noncurrent_version_days" {
+  description = "Days before an overwritten or deleted object version in the job bucket is removed."
+  type        = number
+  default     = 30
+}
+
+variable "report_retention_days" {
+  description = "Days after which input files (drop-glue/requests/) and reports (drop-glue/results/) expire. 0 = keep forever."
+  type        = number
+  default     = 0
+}
+
+variable "environment" {
+  description = "Environment of this tfvars file. Must equal the selected Terraform workspace, so stage values can't be applied to prod."
+  type        = string
+
+  validation {
+    condition     = can(regex("^[a-z0-9]{1,10}$", var.environment))
+    error_message = "environment must be 1-10 lowercase letters or digits (it becomes part of AWS resource names)."
+  }
+}
+
+variable "environments" {
+  description = "Workspaces allowed to deploy. The postfix of every resource name is the workspace."
+  type        = list(string)
+  default     = ["prod", "stage", "uat"]
 }
 
 variable "name" {
-  description = "Prefix for the Glue job and IAM role names."
+  description = "Prefix for the Glue job, IAM role, log group, table and rule names (the -<workspace> postfix is added)."
   type        = string
   default     = "drop-glue"
 
   validation {
-    condition     = can(regex("^[A-Za-z0-9_-]{1,50}$", var.name))
-    error_message = "Name must be 1 to 50 letters, digits, underscores or hyphens."
+    condition     = can(regex("^[A-Za-z0-9_-]{1,40}$", var.name))
+    error_message = "Name must be 1 to 40 letters, digits, underscores or hyphens (IAM role names are limited to 64 characters including the postfix)."
   }
 }
 
@@ -126,7 +165,7 @@ variable "tracker" {
 }
 
 variable "tracker_table_name" {
-  description = "DynamoDB table name for tracker = DYNAMODB. Empty = <name>-processed-files."
+  description = "DynamoDB table base name for tracker = DYNAMODB. Empty = <name>-processed-files. The -<workspace> postfix is added."
   type        = string
   default     = ""
 }

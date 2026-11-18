@@ -35,8 +35,8 @@ Every CSV row has a unique `TRAN_ID`, and its `RAW_RESPONSE` column holds XML wi
 
 | Piece | What it does |
 |---|---|
-| **Find** (`scripts/find.py`, Glue job `drop-glue-find`) | Scans every part file in the chosen months with the chosen **find strategy** ([1.2](#12-find-strategies)): by default it hashes the values in each row's XML and compares them with your input hashes, reporting **MATCH / NO_MATCH / ERROR** per input item with every part file and transaction ID where the customer was found. It also prepares a **work list with one line per part file**. |
-| **Forget** (`scripts/forget.py`, Glue job `drop-glue-forget`) | For each part in the work list, **once**, it loads the part, drops the listed transaction IDs, and saves a new `.tar.gz` under the **same S3 key with the same CSV name inside**. The **forget strategy** ([1.3](#13-forget-strategies)) decides what happens to the old S3 version. |
+| **Find** (`scripts/find.py`, Glue job `drop-glue-find-<env>`) | Scans every part file in the chosen months with the chosen **find strategy** ([1.2](#12-find-strategies)): by default it hashes the values in each row's XML and compares them with your input hashes, reporting **MATCH / NO_MATCH / ERROR** per input item with every part file and transaction ID where the customer was found. It also prepares a **work list with one line per part file**. |
+| **Forget** (`scripts/forget.py`, Glue job `drop-glue-forget-<env>`) | For each part in the work list, **once**, it loads the part, drops the listed transaction IDs, and saves a new `.tar.gz` under the **same S3 key with the same CSV name inside**. The **forget strategy** ([1.3](#13-forget-strategies)) decides what happens to the old S3 version. |
 | `scripts/arguments.py` | Layer 1: parses and validates the job arguments |
 | `scripts/find_strategies.py`, `scripts/forget_strategies.py` | The strategies (one class each) |
 | `scripts/tasks.py` | The work for one part file, run inside Spark tasks |
@@ -75,13 +75,13 @@ flowchart LR
   GF & GR -. "check before every wave" .-> STOP
 ```
 
-**What Terraform creates** (one module per resource, see [7.2](#72-deploy)):
-- The 10 script files in S3.
+**What Terraform creates** (one module per resource, provisioned by the root `Jenkinsfile`, see [7.2](#72-deploy)):
+- The **job bucket** `<job_bucket>-<env>`: versioned, encrypted, public access blocked, ACLs disabled.
 - 2 Glue 5.0 Spark jobs, each with its own CloudWatch log group.
 - 2 least-privilege IAM roles, each with 1 policy.
 - 1 DynamoDB table for the processed-file tracker (when `tracker = "DYNAMODB"`, the default).
 
-Optionally it also creates a lifecycle rule on the source bucket (`manage_source_lifecycle`) and an EventBridge rule for failed runs (`notification_topic_arn`). It creates **no** buckets, Cognito, API Gateway, Lambda, Step Functions or ECS.
+Optionally it also creates a lifecycle rule on the source bucket (`manage_source_lifecycle`) and an EventBridge rule for failed runs (`notification_topic_arn`). The **scripts** aren't Terraform resources: the provisioning pipeline copies `scripts/*.py` into the job bucket (`COPY_SCRIPTS`). It creates **no** Cognito, API Gateway, Lambda, Step Functions or ECS, and it never creates or deletes the archive bucket.
 
 ### 1.1 Three layers
 
@@ -139,7 +139,7 @@ Skipped files count as scanned with no matches (`files_skipped_tracked` in `summ
 
 | `tracker` | Where | Notes |
 |---|---|---|
-| `DYNAMODB` (default) | Table `<name>-processed-files` (PK `file_uri`, SK `scope`), on-demand, PITR on | Lookups in batches of 100, cheap at any size |
+| `DYNAMODB` (default) | Table `<name>-processed-files-<env>` (PK `file_uri`, SK `scope`), on-demand, PITR on | Lookups in batches of 100, cheap at any size |
 | `S3_TAG` | Tag `drop-glue-<strategy>=<fingerprint>:<stage>` on the part file | No extra infrastructure; one GetObjectTagging call per selected file; S3 allows 10 tags per object; a tag belongs to one version, so a rewrite by anything else drops it (and the file is scanned again) |
 | `NONE` | - | Every file is always scanned |
 
@@ -303,7 +303,7 @@ flowchart LR
 **Sizing with a pilot run.** The key number is how long one 100 MB part takes, which depends on how heavy the XML is. Measure it before the first real batch:
 
 1. Run Find on one month with `FILES_PER_WAVE=20`, `MAX_WAVES=1`, `WORKERS=6`.
-2. In the job's CloudWatch log (`/aws-glue/jobs/<name>-find`) the wave line shows, for example, `wave-00001.jsonl: 20 files (0 failed) in 190s, 2000 MB (10.5 MB/s), slowest file 185s`. Every file in `waves/` also records its own `seconds` and `rows`.
+2. In the job's CloudWatch log (`/aws-glue/jobs/<name>-find-<env>`) the wave line shows, for example, `wave-00001.jsonl: 20 files (0 failed) in 190s, 2000 MB (10.5 MB/s), slowest file 185s`. Every file in `waves/` also records its own `seconds` and `rows`.
 3. Estimate the time for a full batch as `parts × seconds per part ÷ files at once`. For example, 3,000 parts × 180 s ÷ 100 = 5,400 s ≈ **1.5 h** of processing. With the defaults (500 parts per run) that's **6 Find runs** of about 15 minutes each (5 waves × ~180 s).
 4. Estimate the cost as `WORKERS × hours × price per DPU-hour`. For example, 26 × 1.5 × $0.44 ≈ **$17**. Check your region's price.
 
@@ -313,7 +313,7 @@ Forget only touches the parts that matched, usually far fewer than Find scanned.
 
 ## 6. Emergency stop
 
-The **stop** pipeline (`jenkins/Jenkinsfile.stop`) is the hard stop. It controls a **stop switch**, an S3 object at `s3://JOB_BUCKET/drop-glue/control/STOP`:
+The **stop** pipeline (`jenkins/Jenkinsfile.stop`) is the hard stop. It controls a **stop switch**, an S3 object at `s3://JOB_BUCKET-<env>/drop-glue/control/STOP`:
 
 | ACTION | Effect |
 |---|---|
@@ -353,82 +353,359 @@ flowchart TD
 | ✔ | Item | Notes |
 |---|---|---|
 | ☐ | **Data lake bucket** (existing) | Parts under one prefix, e.g. `DBD001/archive/YYYY-MM-01/`. **Turn on versioning** so a bad replacement can be recovered. |
-| ☐ | **Job bucket** (existing) | Holds the scripts, input files, reports and the stop switch under `drop-glue/`. It can be the same bucket as the data lake, as long as the prefixes are separate. |
-| ☐ | **KMS** (if the buckets use SSE-KMS) | Add both Glue role ARNs (`terraform output role_arns`) to the key policy: `kms:Decrypt` for find, and `kms:Decrypt` + `kms:GenerateDataKey` for forget. Rewritten parts use the bucket's **default** encryption. |
-| ☐ | **Bucket policies** | If they restrict principals, allow the two Glue roles. |
+| ☐ | **Job bucket name** (created by Terraform) | Pick a globally unique base name for `job_bucket` in `tfvars/<env>.tfvars`; Terraform creates `<job_bucket>-<env>`. It holds the scripts, input files, reports and the stop switch under `drop-glue/`. |
+| ☐ | **KMS** (if the buckets use SSE-KMS) | Add both Glue role ARNs (`terraform output role_arns`) to the key policy: `kms:Decrypt` for find, and `kms:Decrypt` + `kms:GenerateDataKey` for forget ([7.5.3](#753-kms-key-policy-sse-kms-buckets-only)). Rewritten parts use the bucket's **default** encryption. |
+| ☐ | **Archive bucket changes** | Versioning, bucket policy for the two Glue roles, Deny checks, KMS, lifecycle: see [7.5](#75-what-changes-are-needed-at-the-archive-bucket). |
 | ☐ | **Glue capacity quota** | Your account's maximum DPUs must cover `WORKERS` (default 26). |
-| ☐ | **Jenkins agent** | AWS CLI v2, the *Pipeline Utility Steps* plugin, and AWS credentials with the permissions in [section 12](#12-who-can-do-what). |
+| ☐ | **Jenkins agent (batch pipelines)** | AWS CLI v2, the *Pipeline Utility Steps* plugin, and AWS credentials with the permissions in [section 12](#12-who-can-do-what). |
+| ☐ | **Jenkins (provisioning pipeline)** | Agent: Terraform ≥ 1.10, AWS CLI v2. Plugins: *Pipeline: AWS Steps* (`withAWS`), *Pipeline Utility Steps*, *Git*, *Mailer* (plus a configured mail server). Job environment variables `ROLE_NAME`, `ROLE_ACCOUNT`, `EXTERNAL_ID`, `AWS_REGION`, `NOTIFICATION_EMAIL` ([7.2.1](#721-the-provisioning-pipeline-jenkinsfile-at-the-repository-root)), and a deploy role in each account that trusts Jenkins with that external ID. |
 | ☐ | **Terraform** ≥ 1.10 | AWS provider 6.x. 1.10 is needed for S3 native state locking. |
 | ☐ | **State bucket per environment** (existing) | A **separate** bucket for the Terraform state (not the data lake or job bucket), with versioning and default encryption. Set its name and key in `backend/<env>.s3.tfbackend`. Whoever runs Terraform needs `s3:ListBucket` on it and `s3:GetObject`/`PutObject`/`DeleteObject` on the state key and its `.tflock` file. |
 | ☐ | **Hashing rule agreed** | See [section 4](#4-how-hashing-works). |
 
 ### 7.2 Deploy
 
-Each environment has **two files**: where its state lives, and its variables.
+Each environment (`prod`, `stage`, `uat`) is a **Terraform workspace of the same name**, and has two files: where its state lives, and its variables.
 
 ```text
-backend/stage.s3.tfbackend   backend/prod.s3.tfbackend   ← state bucket, key, region, locking
-tfvars/stage.tfvars          tfvars/prod.tfvars          ← buckets, name, sizing, tracker …
-tfvars/example.tfvars                                    ← every variable with its default (reference)
+backend/prod.s3.tfbackend  backend/stage.s3.tfbackend  backend/uat.s3.tfbackend   ← state bucket, prefix, locking
+tfvars/prod.tfvars         tfvars/stage.tfvars         tfvars/uat.tfvars          ← environment, buckets, sizing …
+tfvars/example.tfvars                                                             ← every variable with its default
 ```
 
-1. Edit `backend/<env>.s3.tfbackend`: the state bucket's name and the key (e.g. `drop-glue/prod/terraform.tfstate`).
-2. Edit `tfvars/<env>.tfvars`: the buckets, region and `name`. **Give every environment its own `name`** when they share an AWS account (Glue job, IAM role and table names are account-wide).
-3. Deploy (here `stage`; use `prod` the same way):
+**Environment postfix.** Every name this project creates ends in `-<workspace>` (`terraform.workspace`). For example, `job_bucket = "abcd-job-data"` **creates** the bucket `abcd-job-data-prod` in the `prod` workspace.
+
+| What | Name in workspace `prod` | Where the name is built |
+|---|---|---|
+| Job bucket (created) | `abcd-job-data-prod` | `locals.tf` → `local.job_bucket`, `modules/s3-bucket` |
+| Glue jobs | `drop-glue-find-prod`, `drop-glue-forget-prod` | `main.tf` → `module.job` |
+| IAM roles + inline policies | `drop-glue-find-prod`, `drop-glue-forget-prod` | `main.tf` → `module.role` |
+| CloudWatch log groups | `/aws-glue/jobs/drop-glue-find-prod`, `/aws-glue/jobs/drop-glue-forget-prod` | `modules/glue-job` (from the job name) |
+| DynamoDB tracker table | `drop-glue-processed-files-prod` | `locals.tf` → `local.tracker_table` |
+| EventBridge rule (optional) | `drop-glue-job-state-prod` | `main.tf` → `module.glue_failure_alerts` |
+| Lifecycle rule ID (optional) | `drop-glue-expire-superseded-versions-prod` | `main.tf` → `module.source_lifecycle` |
+| Terraform state | `s3://<state bucket>/drop-glue/prod/terraform.tfstate` | `backend/prod.s3.tfbackend` (`workspace_key_prefix`) |
+
+The **archive (data lake) bucket is not renamed**: `source_bucket` is used exactly as given in each tfvars file, because it is the data, not a resource of this project.
+
+**Guards** (`output "environment"` in `outputs.tf`). The plan fails, before anything is created, when:
+- the workspace is not in `environments` (default `["prod", "stage", "uat"]`). This includes Terraform's `default` workspace, so nothing is ever named `-default`.
+- `environment` in the tfvars file is not the workspace, e.g. `tfvars/stage.tfvars` used in the `prod` workspace.
+
+**Before the first deployment of an environment:**
+1. Edit `backend/<env>.s3.tfbackend`: the state bucket's name.
+2. Edit `tfvars/<env>.tfvars`: `environment`, `job_bucket` (the **base** name of the bucket to create), the archive bucket, region and sizing.
+3. Commit both files to the branch you will deploy.
+
+#### 7.2.1 The provisioning pipeline (`Jenkinsfile` at the repository root)
+
+Create **one** Jenkins Pipeline job, e.g. `drop-glue-provision`, using *Pipeline script from SCM* with script path `Jenkinsfile`. It only provisions infrastructure; the pipelines in `jenkins/` run the batches.
+
+| Parameter | Values | Meaning |
+|---|---|---|
+| `BRANCH` | e.g. `main` | branch or tag of this repository to check out |
+| `TERRAFORM_WORKSPACE` | `stage` / `uat` / `prod` | the environment: selects the workspace, `backend/<env>.s3.tfbackend` and `tfvars/<env>.tfvars` |
+| `ACTION` | `apply` / `destroy` | create/update, or delete everything in that workspace |
+| `DESTROY_ALL` | checkbox | **must be ticked for `destroy`**, otherwise the build stops before touching anything |
+| `COPY_SCRIPTS` | checkbox | `apply` only: copy `scripts/*.py` into `s3://<job bucket>/drop-glue/scripts/`. Tick it whenever the scripts changed. |
+
+**Environment variables.** Set these on the Jenkins job (or folder / agent), not as build parameters:
+
+| Variable | Example | Used for |
+|---|---|---|
+| `ROLE_NAME` | `drop-glue-deployer` | IAM role assumed for **every** AWS and Terraform operation |
+| `ROLE_ACCOUNT` | `111122223333` | AWS account of that role (the account being deployed to) |
+| `EXTERNAL_ID` | (secret string) | the external ID required by the role's trust policy |
+| `AWS_REGION` | `us-east-1` | region of the AWS calls. Also passed to Terraform as `region`, so it **overrides `region` in tfvars**. |
+| `NOTIFICATION_EMAIL` | `team@example.com` (comma-separated allowed) | emails for the change-request prompt, the approval request and the result. Also passed to the Glue jobs as `notify_to`. |
+| `APPROVERS` (optional) | `alice,deploy-approvers` | Jenkins users/groups allowed to answer the prompts; empty = anyone who can build |
+
+For different accounts per environment, give each environment its own Jenkins job or folder with its own variables. The `EXTERNAL_ID` is best stored as a Jenkins secret (credentials binding at folder level) rather than as plain text.
+
+**AWS access.** Every AWS and Terraform command runs inside one `awsSession { … }` closure, which wraps the `withAWS` step from the *Pipeline: AWS Steps* plugin:
+
+```groovy
+withAWS(role: env.ROLE_NAME, roleAccount: env.ROLE_ACCOUNT, externalId: env.EXTERNAL_ID,
+        region: env.AWS_REGION, roleSessionName: "drop-glue-provision-${BUILD_NUMBER}", duration: 3600) { … }
+```
+
+Nothing runs with the agent's own credentials, apart from the sts:AssumeRole call that starts the session. Each stage opens a fresh 1-hour session, so waiting at the prompts never uses up a session. The assumed role needs a trust policy that allows the Jenkins identity with the external ID:
+
+```json
+{
+  "Effect": "Allow",
+  "Principal": { "AWS": "arn:aws:iam::<jenkins account>:role/<jenkins agent role>" },
+  "Action": "sts:AssumeRole",
+  "Condition": { "StringEquals": { "sts:ExternalId": "<EXTERNAL_ID>" } }
+}
+```
+
+Its permissions must cover the state bucket, the job bucket, Glue, IAM (roles `drop-glue-*` and their inline policies, `iam:PassRole` to Glue), CloudWatch Logs, DynamoDB and EventBridge. Add S3 lifecycle on the archive bucket if `manage_source_lifecycle = true`.
+
+**Guards before anything changes:**
+1. **Prod change request.** With `TERRAFORM_WORKSPACE=prod`, the build first asks for the **change request number** (3–32 letters, digits, `_` or `-`, e.g. `CHG0012345`). It waits **10 minutes**, then aborts. The number is shown in the build description, the approval prompt and every email.
+2. **Approval.** After the plan, the build stops at a prompt showing the workspace, the action, the plan summary (`Plan: N to add, N to change, N to destroy`), branch and commit, the change request, and a link to `tfplan.txt`. It also emails `NOTIFICATION_EMAIL`. If nobody confirms within **10 minutes**, the build is aborted and **nothing is applied or destroyed**. This gate applies to every workspace and to both `apply` and `destroy`.
+
+```mermaid
+flowchart TD
+  V["Validate env vars + parameters<br/>destroy without DESTROY_ALL → stop"] --> CR{"prod?"}
+  CR -- yes --> CRI["ask for the change request number<br/>(10 min, email sent)"] --> C
+  CR -- no --> C["Checkout BRANCH"]
+  C --> I["withAWS: terraform init (backend/&lt;env&gt;.s3.tfbackend)<br/>workspace select -or-create &lt;env&gt;, validate"]
+  I --> A{ACTION}
+  A -- apply --> P["withAWS: plan"]
+  A -- destroy --> PD["withAWS: refuse if a Find/Forget run is active,<br/>plan -destroy"]
+  P & PD --> AP{"APPROVAL<br/>10 min, email sent<br/>timeout / reject → abort, nothing changed"}
+  AP -- "apply" --> X1["withAWS: terraform apply tfplan"]
+  AP -- "destroy" --> X2["withAWS: check runs again,<br/>job bucket force_destroy = true,<br/>plan -destroy + apply"]
+  X1 --> S{"COPY_SCRIPTS<br/>or no scripts yet?"}
+  S -- yes --> CP["withAWS: refuse if a run is active,<br/>aws s3 sync scripts/*.py, check all 10 modules"]
+  S -- no --> O
+  CP --> O["withAWS: print outputs for the batch Jenkins jobs"]
+  O & X2 --> N["email the result (success / failed / aborted)"]
+```
+
+- **First apply of an environment** copies the scripts even if `COPY_SCRIPTS` isn't ticked, because the jobs can't run without them.
+- **Later applies** leave the scripts alone unless `COPY_SCRIPTS` is ticked. Infrastructure changes and script changes are separate decisions.
+- **The scripts are copied in place** under fixed names: there's no versioned folder. The jobs load them when a run **starts**, so the pipeline refuses to copy while a Find or Forget run is active. The bucket is versioned, so an older copy of a script can be restored from its previous version.
+- **`destroy` + `DESTROY_ALL`** deletes the Glue jobs, roles, log groups, tracker table, the optional rules **and the job bucket with every object version in it**: scripts, input files and all reports. Download any reports you must keep first. The archive bucket itself is never deleted. With `manage_source_lifecycle = true`, its lifecycle configuration **is** removed.
+- `tfplan.txt` (the plan) and `terraform-outputs.json` are attached to every build. The plan is attached **before** the approval prompt, so it can be reviewed there.
+- A destroy plan is re-created right after approval, because the job bucket first has to be switched to `force_destroy`. A Find/Forget run that started while the approval was pending stops the build at that point.
+- After an `apply`, the build prints the values to set as defaults in the `jenkins/` batch pipelines (7.3).
+
+Restrict who can build `drop-glue-provision`, especially with `TERRAFORM_WORKSPACE=prod`.
+
+#### 7.2.2 Running Terraform by hand (same steps as the pipeline)
 
 ```text
-terraform init -reconfigure -backend-config=backend/stage.s3.tfbackend
-terraform fmt -check -recursive
-terraform validate
-terraform plan -var-file=tfvars/stage.tfvars -out=stage.tfplan
-terraform apply stage.tfplan
-terraform output
+terraform init -reconfigure -backend-config=backend/prod.s3.tfbackend
+terraform workspace select -or-create prod
+terraform plan -var-file=tfvars/prod.tfvars -out=prod.tfplan
+terraform apply prod.tfplan
+aws s3 sync scripts/ "$(terraform output -raw scripts_prefix)" --exclude "*" --include "*.py"
 ```
 
-Always run `init -reconfigure` with the matching backend file before switching environment; otherwise the plan would run against the other environment's state. To add an environment (e.g. `dev`), copy both files and change the key, name and buckets.
+Before switching environment, run **both** `init -reconfigure` with that environment's backend file **and** `workspace select <env>`. To add an environment (e.g. `dev`): add it to `environments`, copy a backend file and a tfvars file, set `environment = "dev"`, then add `dev` to the `TERRAFORM_WORKSPACE` choices in `Jenkinsfile`.
+
+> **Upgrading an existing deployment:** the names change (`drop-glue-find` → `drop-glue-find-prod`), so Terraform **replaces** the Glue jobs, roles, log groups and tracker table, and **creates** the job bucket `<job_bucket>-<env>`. Finish or abandon running batches first, run the pipeline with `COPY_SCRIPTS`, and copy any old reports you need from the previous bucket. Then update the Jenkins defaults (`GLUE_JOB`, `RESULT_PREFIX`, `STOP_URI`) from the outputs, and the archive bucket and KMS key policies with the new role ARNs ([7.5](#75-what-changes-are-needed-at-the-archive-bucket)).
 
 **Module layout:** each resource has its own module, and the root (`main.tf`) only wires them together:
 
 | Module | Resource(s) | Created |
 |---|---|---|
-| `modules/s3-scripts` | the 10 Python scripts in the job bucket | always |
+| `modules/s3-bucket` | the job bucket, with its versioning, encryption, public access block, ownership and lifecycle settings | always |
 | `modules/iam-role` | one IAM role + its inline policy, per job | always (2) |
-| `modules/glue-job` | one Glue Spark job **+ its CloudWatch log group** `/aws-glue/jobs/<name>-<find\|forget>` | always (2) |
+| `modules/glue-job` | one Glue Spark job **+ its CloudWatch log group** `/aws-glue/jobs/<name>-<find\|forget>-<env>` | always (2) |
 | `modules/dynamodb-table` | the processed-file tracker table | `tracker = "DYNAMODB"` |
 | `modules/s3-lifecycle` | lifecycle rule expiring superseded versions | `manage_source_lifecycle = true` |
 | `modules/eventbridge-rule` | rule + SNS target for failed/killed runs | `notification_topic_arn` set |
 
-`moved.tf` maps an existing deployment from the older layout onto these modules, so nothing is destroyed. It also stops managing the old shared `/aws-glue/jobs/*` log groups without deleting them.
+`moved.tf` maps an existing deployment from the older layout onto these modules. It also stops managing the old shared `/aws-glue/jobs/*` log groups and the old Terraform-managed script objects, without deleting them.
 
 Expected output (values differ):
 
 ```text
-job_names      = { "find" = "drop-glue-find", "forget" = "drop-glue-forget" }
-request_prefix = "s3://my-job-bucket/drop-glue/requests/"
-result_prefix  = "s3://my-job-bucket/drop-glue/results/"
-stop_uri       = "s3://my-job-bucket/drop-glue/control/STOP"
-role_arns      = { "find" = "arn:aws:iam::111122223333:role/drop-glue-find", "forget" = "..." }
+environment    = "prod"
+job_bucket     = "abcd-job-data-prod"
+job_names      = { "find" = "drop-glue-find-prod", "forget" = "drop-glue-forget-prod" }
+request_prefix = "s3://abcd-job-data-prod/drop-glue/requests/"
+result_prefix  = "s3://abcd-job-data-prod/drop-glue/results/"
+stop_uri       = "s3://abcd-job-data-prod/drop-glue/control/STOP"
+role_arns      = { "find" = "arn:aws:iam::111122223333:role/drop-glue-find-prod", "forget" = "..." }
 ```
 
 > **Upgrading from an earlier version:** the jobs change from Python shell to Spark, so they're updated in place. The old `drop-glue-match`/`drop-glue-remove` jobs and roles from the first version are replaced.
 
 ### 7.3 Create the Jenkins jobs
 
-| Jenkins job | Script path |
-|---|---|
-| `drop-glue-find` | `jenkins/Jenkinsfile.find` |
-| `drop-glue-status` | `jenkins/Jenkinsfile.status` |
-| `drop-glue-forget` | `jenkins/Jenkinsfile.forget` |
-| `drop-glue-stop` | `jenkins/Jenkinsfile.stop` |
+| Jenkins job | Script path | Purpose |
+|---|---|---|
+| `drop-glue-provision` | `Jenkinsfile` (repository root) | provision / destroy an environment, copy the scripts ([7.2.1](#721-the-provisioning-pipeline-jenkinsfile-at-the-repository-root)) |
+| `drop-glue-find` | `jenkins/Jenkinsfile.find` | find-and-forget: start / continue a Find batch |
+| `drop-glue-status` | `jenkins/Jenkinsfile.status` | find-and-forget: progress and reports |
+| `drop-glue-forget` | `jenkins/Jenkinsfile.forget` | find-and-forget: delete the found rows |
+| `drop-glue-stop` | `jenkins/Jenkinsfile.stop` | find-and-forget: KILL / PAUSE / RESUME |
 
 1. Create each one as a Pipeline job using *Pipeline script from SCM*.
 2. Run each once so Jenkins registers its parameters.
-3. Set the defaults for `GLUE_JOB`/`FIND_JOB`/`FORGET_JOB`, `RESULT_PREFIX`, `STOP_URI`, `AWS_REGION` and `WORKER_TYPE` from the Terraform outputs.
-4. Restrict who can build `drop-glue-forget` and `drop-glue-stop`.
+3. In the four batch jobs, set the defaults for `GLUE_JOB`/`FIND_JOB`/`FORGET_JOB`, `RESULT_PREFIX`, `STOP_URI`, `AWS_REGION` and `WORKER_TYPE` from the outputs printed by `drop-glue-provision`. Use one set of batch jobs (or folder) per environment.
+4. Restrict who can build `drop-glue-provision`, `drop-glue-forget` and `drop-glue-stop`.
 
 ### 7.4 Recommended: expire old files
 
-Reports contain transaction IDs and hashes. Add a lifecycle rule to the job bucket that expires `drop-glue/requests/` and `drop-glue/results/` after an agreed period. Do this in the bucket's own configuration. Terraform doesn't do it here, because adding a rule from this project would replace any lifecycle rules the bucket already has.
+Reports contain transaction IDs and hashes. Set `report_retention_days` in `tfvars/<env>.tfvars` (e.g. `180`) so the job bucket expires `drop-glue/requests/` and `drop-glue/results/` after that many days. The default `0` keeps them forever. Old object versions in the job bucket are removed after `job_bucket_noncurrent_version_days` (default 30).
+
+### 7.5 What changes are needed at the archive bucket
+
+Terraform never modifies the archive (data lake) bucket itself. The only exception is the optional lifecycle rule (`manage_source_lifecycle`). Everything below is done **once per environment by the bucket owner**, after `terraform apply`, because the role ARNs only exist then:
+
+```text
+terraform output role_arns
+# { "find" = "arn:aws:iam::111122223333:role/drop-glue-find-prod", "forget" = "arn:aws:iam::111122223333:role/drop-glue-forget-prod" }
+```
+
+| # | Change | Required? |
+|---|---|---|
+| 1 | Turn on **versioning** | Strongly recommended: the only way to undo a bad rewrite. Needed for `REPLACE_PURGE_OLD_VERSIONS` / `REPLACE_TAG_FOR_LIFECYCLE` to matter. |
+| 2 | **Bucket policy** allowing the two Glue roles | See 7.5.1 for when it's needed |
+| 3 | Check the existing bucket policy for **Deny** statements that would block the roles | Always (7.5.2) |
+| 4 | **KMS key policy** for both roles | If the bucket uses SSE-KMS with a customer-managed key (7.5.3) |
+| 5 | **Lifecycle rule** for superseded versions | If you use `REPLACE_TAG_FOR_LIFECYCLE` and `manage_source_lifecycle = false` (7.5.4) |
+| 6 | Review Object Lock, replication and event notifications | Always (7.5.5) |
+
+#### 7.5.1 Bucket policy
+
+**When it's needed:**
+- **The archive bucket is in a different AWS account from the Glue jobs:** required. Cross-account access needs **both** the role policy (created by Terraform) **and** this bucket policy.
+- **Same account, and the bucket policy has no Deny that matches the roles:** not strictly required, because the IAM role policies from Terraform are enough. Adding it is still recommended: it documents on the bucket who may rewrite it, and it keeps working if someone later adds a restrictive policy.
+
+Replace `ARCHIVE_BUCKET`, `DBD001/archive/` and the two role ARNs, using the values for your environment from `tfvars/<env>.tfvars` and `terraform output role_arns`. Merge these statements into the bucket's existing policy; **don't overwrite it**.
+
+```json
+{
+  "Version": "2012-10-17",
+  "Statement": [
+    {
+      "Sid": "DropGlueFindList",
+      "Effect": "Allow",
+      "Principal": { "AWS": "arn:aws:iam::111122223333:role/drop-glue-find-prod" },
+      "Action": "s3:ListBucket",
+      "Resource": "arn:aws:s3:::ARCHIVE_BUCKET",
+      "Condition": { "StringLike": { "s3:prefix": ["DBD001/archive/*"] } }
+    },
+    {
+      "Sid": "DropGlueFindRead",
+      "Effect": "Allow",
+      "Principal": { "AWS": "arn:aws:iam::111122223333:role/drop-glue-find-prod" },
+      "Action": "s3:GetObject",
+      "Resource": "arn:aws:s3:::ARCHIVE_BUCKET/DBD001/archive/*"
+    },
+    {
+      "Sid": "DropGlueForgetReadWrite",
+      "Effect": "Allow",
+      "Principal": { "AWS": "arn:aws:iam::111122223333:role/drop-glue-forget-prod" },
+      "Action": ["s3:GetObject", "s3:PutObject"],
+      "Resource": "arn:aws:s3:::ARCHIVE_BUCKET/DBD001/archive/*"
+    },
+    {
+      "Sid": "DropGlueForgetPurgeListVersions",
+      "Effect": "Allow",
+      "Principal": { "AWS": "arn:aws:iam::111122223333:role/drop-glue-forget-prod" },
+      "Action": "s3:ListBucketVersions",
+      "Resource": "arn:aws:s3:::ARCHIVE_BUCKET",
+      "Condition": { "StringLike": { "s3:prefix": ["DBD001/archive/*"] } }
+    },
+    {
+      "Sid": "DropGlueForgetPurgeDeleteVersions",
+      "Effect": "Allow",
+      "Principal": { "AWS": "arn:aws:iam::111122223333:role/drop-glue-forget-prod" },
+      "Action": "s3:DeleteObjectVersion",
+      "Resource": "arn:aws:s3:::ARCHIVE_BUCKET/DBD001/archive/*"
+    },
+    {
+      "Sid": "DropGlueForgetLifecycleTagging",
+      "Effect": "Allow",
+      "Principal": { "AWS": "arn:aws:iam::111122223333:role/drop-glue-forget-prod" },
+      "Action": ["s3:GetObjectVersionTagging", "s3:PutObjectVersionTagging"],
+      "Resource": "arn:aws:s3:::ARCHIVE_BUCKET/DBD001/archive/*"
+    },
+    {
+      "Sid": "DropGlueS3TagTracker",
+      "Effect": "Allow",
+      "Principal": { "AWS": [
+        "arn:aws:iam::111122223333:role/drop-glue-find-prod",
+        "arn:aws:iam::111122223333:role/drop-glue-forget-prod"
+      ] },
+      "Action": ["s3:GetObjectTagging", "s3:PutObjectTagging", "s3:GetObjectVersionTagging", "s3:PutObjectVersionTagging"],
+      "Resource": "arn:aws:s3:::ARCHIVE_BUCKET/DBD001/archive/*"
+    }
+  ]
+}
+```
+
+| Statement | Keep it when | What it allows |
+|---|---|---|
+| `DropGlueFindList` | always | Find lists the month folders and part files, only under the archive prefix |
+| `DropGlueFindRead` | always | Find reads each part. Find **never writes** to the archive (except with the S3_TAG tracker). |
+| `DropGlueForgetReadWrite` | always | Forget reads each part and writes the cleaned copy under the **same key** (a new version). No `s3:DeleteObject` is needed. |
+| `DropGlueForgetPurge…` (2) | `FORGET_STRATEGY=REPLACE_PURGE_OLD_VERSIONS` will be used (`allow_version_purge = true`) | delete the old versions that still hold the removed rows |
+| `DropGlueForgetLifecycleTagging` | `REPLACE_TAG_FOR_LIFECYCLE` will be used (`allow_lifecycle_tagging = true`) | tag the old version `drop-glue-superseded=true` |
+| `DropGlueS3TagTracker` | `tracker = "S3_TAG"` only (**remove it** with the default `DYNAMODB` tracker) | read and write the tracker tag on each part |
+
+The policy is written for the `prod` workspace (`drop-glue-find-prod` / `drop-glue-forget-prod`). For the other environments the role names end in `-stage` / `-uat`. If several environments share one archive bucket, add every environment's role ARNs.
+
+Two notes on applying it:
+- A bucket policy that names a role by ARN stores the role's internal ID. **If the role is ever deleted and recreated** (e.g. `terraform destroy` + `apply`), the statement stops matching, and you must save the policy again. To avoid that, use `"Principal": {"AWS": "*"}` with `"Condition": {"ArnEquals": {"aws:PrincipalArn": "<role ARN>"}}` instead.
+- Apply it with the bucket owner's credentials, e.g. `aws s3api get-bucket-policy` → merge → `aws s3api put-bucket-policy --policy file://policy.json`.
+
+#### 7.5.2 Existing Deny statements to check
+
+An explicit Deny always wins over these Allows. Common ones that break drop-glue:
+
+| Existing statement | Effect on drop-glue | Fix |
+|---|---|---|
+| Deny `s3:PutObject` without the header `s3:x-amz-server-side-encryption` (the older "enforce encryption" pattern) | **Every Forget rewrite fails** with AccessDenied: Forget doesn't send that header and relies on the bucket's default encryption | Remove it (default encryption makes it unnecessary), or add `ServerSideEncryption` to the `put_object` call in `tasks.rewrite_archive` |
+| Deny unless `aws:SourceVpce` / `aws:SourceVpc` matches | Find and Forget are denied: the Glue jobs have no VPC connection and reach S3 over its public endpoint | Add the role ARNs to the exception (`aws:PrincipalArn`), or give the jobs a Glue VPC connection with an S3 gateway endpoint (not in this project) |
+| Deny unless `aws:PrincipalOrgID` / an allow-list of principals | denied if the roles aren't covered | add the role ARNs to the exception |
+| Deny `s3:PutObject` for everyone except the writer application | Forget can't rewrite | add the Forget role ARN to the exception |
+| Deny when `aws:SecureTransport` is false | no effect: boto3 always uses HTTPS | none |
+
+#### 7.5.3 KMS key policy (SSE-KMS buckets only)
+
+Rewritten parts use the bucket's **default** encryption. Add to the key policy of the bucket's key:
+
+```json
+[
+  {
+    "Sid": "DropGlueFindDecrypt",
+    "Effect": "Allow",
+    "Principal": { "AWS": "arn:aws:iam::111122223333:role/drop-glue-find-prod" },
+    "Action": "kms:Decrypt",
+    "Resource": "*"
+  },
+  {
+    "Sid": "DropGlueForgetDecryptEncrypt",
+    "Effect": "Allow",
+    "Principal": { "AWS": "arn:aws:iam::111122223333:role/drop-glue-forget-prod" },
+    "Action": ["kms:Decrypt", "kms:GenerateDataKey"],
+    "Resource": "*"
+  }
+]
+```
+
+With SSE-S3 (the AES-256 default) nothing is needed. Turning on S3 Bucket Keys also cuts the KMS request cost.
+
+#### 7.5.4 Lifecycle rule for `REPLACE_TAG_FOR_LIFECYCLE`
+
+If the bucket already has lifecycle rules, keep `manage_source_lifecycle = false` and **add this rule** to the existing configuration (`aws s3api get-bucket-lifecycle-configuration` → add → `put-bucket-lifecycle-configuration`):
+
+```json
+{
+  "ID": "drop-glue-expire-superseded-versions",
+  "Status": "Enabled",
+  "Filter": {
+    "And": {
+      "Prefix": "DBD001/archive/",
+      "Tags": [{ "Key": "drop-glue-superseded", "Value": "true" }]
+    }
+  },
+  "NoncurrentVersionExpiration": { "NoncurrentDays": 7 }
+}
+```
+
+Test it on a dev bucket before relying on it. Rewrite one part with `REPLACE_TAG_FOR_LIFECYCLE`, then check that the tagged old version disappears after the configured days.
+
+#### 7.5.5 Other bucket features to review
+
+| Feature | Why it matters | What to do |
+|---|---|---|
+| **Object Lock** | Forget can still write the new version, but locked old versions **can't be purged or expired** until their retention ends | Agree retention with compliance before promising that rows are gone |
+| **Replication** (CRR/SRR) | The rewritten part replicates as a new version, but **deletions of old versions are not replicated**, so the destination keeps the removed rows | Run the same cleanup on the destination bucket, or add a lifecycle rule there |
+| **Event notifications / EventBridge** | Every rewrite is an `ObjectCreated:Put` event; downstream consumers may reprocess the part | Make consumers ignore objects whose metadata has `drop-glue-batch`, or pause them during Forget |
+| **Storage class** | Forget keeps each part's storage class. Standard-IA / Glacier IR add retrieval fees and minimum-storage charges ([COST_ESTIMATE.md](COST_ESTIMATE.md)). | Check before large batches |
+| **Object tags** on parts | **Not copied** to the rewritten part (only content type and user metadata are) | Re-apply them after Forget if anything depends on them |
+| **Object Ownership** | Cross-account writes with ACLs enabled could leave rewritten parts owned by the Glue account | Set Object Ownership to **Bucket owner enforced** (ACLs disabled) |
+| **Requester Pays** | Not supported by the jobs | Leave it off |
 
 ---
 
@@ -436,7 +713,7 @@ Reports contain transaction IDs and hashes. Add a lifecycle rule to the job buck
 
 ### 8.1 Prepare the input file (HASH_MATCH only)
 
-`TRAN_ID_SUFFIX` needs no input file: skip to 8.2. For `HASH_MATCH`, upload a JSON array to `s3://JOB_BUCKET/drop-glue/requests/` (full example: [`examples/input.json`](../examples/input.json)):
+`TRAN_ID_SUFFIX` needs no input file: skip to 8.2. For `HASH_MATCH`, upload a JSON array to `s3://JOB_BUCKET-<env>/drop-glue/requests/` (full example: [`examples/input.json`](../examples/input.json)):
 
 ```json
 [
@@ -462,7 +739,7 @@ Build **drop-glue-find**:
 | `BATCH_ID` | (empty) | Empty starts a **new** batch named `<job>-<build number>` |
 | `FIND_STRATEGY` | `HASH_MATCH` | The drop-down: `HASH_MATCH` or `TRAN_ID_SUFFIX` ([1.2](#12-find-strategies)). Used for a new batch only. |
 | `TRAN_ID_SUFFIX` | `_c` | `TRAN_ID_SUFFIX` only: the suffix to pick |
-| `INPUT_URI` | `s3://JOB_BUCKET/drop-glue/requests/batch-2026-11-16.json` | `HASH_MATCH` only: the file from 8.1 (leave empty for `TRAN_ID_SUFFIX`) |
+| `INPUT_URI` | `s3://JOB_BUCKET-<env>/drop-glue/requests/batch-2026-11-16.json` | `HASH_MATCH` only: the file from 8.1 (leave empty for `TRAN_ID_SUFFIX`) |
 | `ARCHIVE_URI` | `s3://data-lake/DBD001/archive/` | The archive folder, or a single part file |
 | `MONTH_FROM` / `MONTH_TO` | `2026-01` / `2026-03` | Inclusive. The folder `2026-01-01` belongs to month `2026-01`. **Leave both empty to scan the whole archive.** |
 | `HASH_MODE` | `auto` | `HASH_MATCH` only. `auto` means `normalized` for a new batch ([section 4](#4-how-hashing-works)) |
@@ -600,9 +877,9 @@ Two user-metadata tags are added: `drop-glue-batch` and `drop-glue-source-etag`.
 ## 11. S3 layout
 
 ```text
-s3://JOB_BUCKET/drop-glue/
-├── scripts/<sha256>/{find,forget,arguments,find_strategies,forget_strategies,
-│                     tasks,tracking,notify,common,formats}.py   ← uploaded by Terraform
+s3://JOB_BUCKET-<env>/drop-glue/
+├── scripts/{find,forget,arguments,find_strategies,forget_strategies,
+│            tasks,tracking,notify,common,formats}.py   ← copied by the provisioning pipeline (COPY_SCRIPTS)
 ├── control/STOP                          ← emergency stop switch (exists = ON)
 ├── requests/
 │   └── batch-2026-11-16.json             ← input file (you; don't change during a batch)
@@ -622,7 +899,7 @@ s3://DATA_LAKE/DBD001/archive/            ← source_prefix: the ONLY place the 
 ├── 2026-02-01/AB_CDEFG_DATA_02_part_0001.tar.gz …
 └── ...
 
-DynamoDB <name>-processed-files           ← tracker = DYNAMODB: (file_uri, scope) → etag, stage, batch_id
+DynamoDB <name>-processed-files-<env>       ← tracker = DYNAMODB: (file_uri, scope) → etag, stage, batch_id
 ```
 
 ---
@@ -664,10 +941,10 @@ flowchart LR
   "Statement": [
     {"Effect": "Allow", "Action": ["glue:StartJobRun", "glue:GetJobRun", "glue:GetJobRuns", "glue:BatchStopJobRun"],
      "Resource": "arn:aws:glue:REGION:ACCOUNT:job/drop-glue-*"},
-    {"Effect": "Allow", "Action": "s3:PutObject", "Resource": "arn:aws:s3:::JOB_BUCKET/drop-glue/requests/*"},
-    {"Effect": "Allow", "Action": "s3:GetObject", "Resource": "arn:aws:s3:::JOB_BUCKET/drop-glue/results/*"},
+    {"Effect": "Allow", "Action": "s3:PutObject", "Resource": "arn:aws:s3:::JOB_BUCKET-<env>/drop-glue/requests/*"},
+    {"Effect": "Allow", "Action": "s3:GetObject", "Resource": "arn:aws:s3:::JOB_BUCKET-<env>/drop-glue/results/*"},
     {"Effect": "Allow", "Action": ["s3:GetObject", "s3:PutObject", "s3:DeleteObject"],
-     "Resource": "arn:aws:s3:::JOB_BUCKET/drop-glue/control/*"}
+     "Resource": "arn:aws:s3:::JOB_BUCKET-<env>/drop-glue/control/*"}
   ]
 }
 ```
@@ -679,7 +956,7 @@ The Glue roles can only list inside their own prefixes. They can't touch anythin
 ## 13. Troubleshooting
 
 Glue logs are in CloudWatch, under the Glue run ID that the Jenkins console prints:
-- `/aws-glue/jobs/<name>-find` and `/aws-glue/jobs/<name>-forget` (`terraform output log_groups`): each job's own continuous log, with driver progress (one line per wave) and executor logs. Created by `modules/glue-job` with `log_retention_days`.
+- `/aws-glue/jobs/<name>-find-<env>` and `/aws-glue/jobs/<name>-forget-<env>` (`terraform output log_groups`): each job's own continuous log, with driver progress (one line per wave) and executor logs. Created by `modules/glue-job` with `log_retention_days`.
 - `/aws-glue/jobs/output` and `/aws-glue/jobs/error`: Glue's shared groups (not managed here)
 
 | Symptom / message | Meaning | What to do |
@@ -725,7 +1002,7 @@ The formats are expected to change. All code that knows the JSON layouts is in *
 3. If old files must stay readable, add the new version to `SUPPORTED_SCHEMA_VERSIONS` and branch on `schema_version`. Otherwise bump `SCHEMA_VERSION`. Batches started with the old version must finish before the upgrade.
 4. Run `pytest tests/`. `tests/test_formats.py` fails until the examples and the code agree.
 5. Update section 8 of this guide, and the `readJSON` fields in `jenkins/Jenkinsfile.status` and `Jenkinsfile.forget` if you renamed any `summary.json` field.
-6. Run `terraform apply` to upload the new scripts. Their S3 folders are content hashes, so the jobs switch to them atomically.
+6. Run the provisioning pipeline (`drop-glue-provision`) with `ACTION=apply` and **`COPY_SCRIPTS` ticked**, when no Find/Forget run is active. Runs that start afterwards use the new scripts.
 
 ### 14.1 Adding a strategy
 
